@@ -1,0 +1,151 @@
+================================================================================
+BASELINE METRICS - SAM3 SEMANTIC MODE
+================================================================================
+Date: 2026-01-31
+Scene: office1
+Frames: 2000
+Mode: sam3_semantic
+Text Embeddings: ensemble
+
+================================================================================
+SEMANTIC SEGMENTATION METRICS
+================================================================================
+mIoU:           14.10%
+mAcc:           23.70%
+f-mIoU:         36.22%
+f-mAcc:         46.32%
+
+================================================================================
+INSTANCE METRICS
+================================================================================
+Total Objects:              54
+Objects with SAM3 votes:    54
+Instance Accuracy:          22/54 (40.7%)
+Misclassified Objects:      32
+Avg Votes per Object:       71.3
+Avg Confidence:             79.5%
+
+================================================================================
+PER-CLASS BREAKDOWN (IoU / Acc)
+================================================================================
+wall          : 54.95%    79.85%
+ceiling       : 48.00%    54.91%
+floor         : 60.02%    69.49%
+chair         : 32.88%    32.91%
+blinds        :  0.00%     0.00%
+sofa          :  0.00%     0.00%
+table         :  0.00%     0.00%
+lamp          :  0.00%     0.00%
+door          :  7.89%     7.90%
+pillow        :  0.00%     0.00%
+tv-screen     :  0.00%     0.00%
+pillar        :  0.00%     0.00%
+blanket       : 51.33%    51.34%
+tv-stand      :  0.00%     0.00%
+cushion       :  0.00%     0.00%
+bin           : 76.06%    78.12%
+vent          :  0.00%     0.00%
+desk          : 28.24%    36.94%
+monitor       : 22.23%    22.24%
+pipe          :  0.00%     0.00%
+panel         :  0.00%     0.00%
+desk-organizer:  0.00%     0.00%
+wall-plug     :  0.00%     0.00%
+box           :  0.00%     0.00%
+clock         :  0.00%     0.00%
+tissue-paper  :  0.00%     0.00%
+bottle        : 15.21%   100.00%
+cloth         : 12.38%    79.69%
+switch        :  0.09%    73.86%
+
+================================================================================
+PERFORMANCE METRICS
+================================================================================
+Total Time:         415.31s
+Average FPS:        4.82 Hz (pipeline), 4.99 Hz (efficiency)
+Avg VRAM:           5289 MB
+Peak VRAM:          5783 MB (12787 MB absolute peak)
+Avg GPU Util:       53.1%
+
+Latency Breakdown (ms):
+  tracking:    17.2 ± 87.2  (8.6% of frame)
+  mapping:    101.2 ± 55.4  (5.1% of frame)
+  semantics:   38.9 ± 413.0 (40.7% of frame)
+
+================================================================================
+ERROR ANALYSIS - MISCLASSIFIED OBJECTS (32 total)
+================================================================================
+Category Breakdown:
+  Sibling Confusion:      18 objects (~380K points, 40% of error points)
+  GT Unmapped/Issue:       5 objects (~290K points, 30% of error points)
+  Context/Geometry Error:  6 objects (~410K points, 27% of error points)
+  Vocabulary Mismatch:     3 objects (~17K points, 2% of error points)
+
+Key Sibling Confusion Groups:
+  cushion <-> pillow <-> chair:  6 objects, 243K points
+  cloth <-> blanket:             3 objects, 24K points
+  tv-stand <-> desk <-> table:   5 objects, 39K points
+  panel <-> door:                1 object,  42K points
+  tv-screen <-> monitor:         1 object,  34K points
+  bottle <-> tissue-paper:       2 objects, 2K points
+  switch <-> wall-plug:          1 object,  0.1K points
+
+High-Confidence Errors (conf > 60%):
+  ID 4:  panel (71.7%) -> GT: door
+  ID 17: bottle (62.7%) -> GT: tissue-paper
+  ID 20: floor (66.7%) -> GT: wall
+
+================================================================================
+MOBILE_SAM + CLIP COMPARISON (2000 frames)
+================================================================================
+Mode: mobile_sam
+Frames: 2000
+mIoU:           8.57%
+mAcc:          18.75%
+f-mIoU:         8.22%
+f-mAcc:        19.09%
+
+Total Objects:      34
+Instance Accuracy:  5/34 (14.7%)
+Avg Confidence:     0.0% (no SAM3 votes - CLIP only)
+
+Total Time:     512.98s
+Average FPS:    3.90 Hz
+Avg VRAM:       3495.72 MB
+Peak VRAM:      5583.67 MB
+
+Per-Class (IoU / Acc):
+  wall          :  0.11%     0.11%
+  door          : 54.66%    91.51%
+  pillow        : 17.73%    95.97%
+  bin           : 80.53%    82.76%
+  desk          : 51.14%    97.54%
+  cloth         :  1.61%    82.13%
+  (all others   :  0.00%     0.00%)
+
+Key Issues:
+  - "Cloth attractor" problem: 15/34 objects classified as cloth
+  - Very low confidence on most predictions
+  - SAM3 semantic outperforms by +5.5% mIoU, +26% instance accuracy
+
+================================================================================
+NOTES
+================================================================================
+- SAM3 mask generation is reliable (30-50 masks/frame)
+- Fusion is working correctly
+- Main issue is classification, not detection
+- SAM3 confidence is unreliable (high even when wrong)
+- Potential improvement from SigLIP K-pool validation: ~10-15% instance acc
+
+================================================================================
+NEXT EXPERIMENT: SigLIP K-Pool Override
+================================================================================
+Hypothesis: Using SigLIP to validate/override SAM3's classification against
+            SAM3's own top-K predictions may improve sibling disambiguation.
+
+Expected Impact:
+  - Best case: +18 correct objects (55.6% instance acc)
+  - Realistic: +5-8 correct objects (~50% instance acc)
+  - Compute cost: ~50ms/mask additional
+
+================================================================================
