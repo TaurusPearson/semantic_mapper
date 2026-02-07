@@ -464,6 +464,7 @@ import eval_utils
 import instance_utils
 from segment_utils import CLIPGenerator
 from async_components import AsyncCLIPProcessor, AsyncMapper, PTAMController, MultiprocessingCLIPProcessor
+from replica_prompts import IMAGENET_TEMPLATES
 
 # ============================================================
 # SECTION 1: PROMPTS & CONFIG
@@ -481,6 +482,11 @@ SEMANTIC_CONFIGS = [
         "name": "siglip",
         "kind": "dual_encoder",
         "model_id": "google/siglip-so400m-patch14-224",
+    },
+    {
+        "name": "siglip2",
+        "kind": "dual_encoder",
+        "model_id": "timm/ViT-SO400M-14-SigLIP2-384",
     },
 ]
 
@@ -718,7 +724,7 @@ class SemanticClassifier:
              raise ValueError(f"Backbone '{sem_name}' has no 'text_bank' loaded. Check main() setup.")
         
         # --- Continue with SigLIP Parameter Fix (Previous Step) ---
-        self.siglip = (backbone.name == "siglip")
+        self.siglip = (backbone.name in ["siglip", "siglip2"])
 
         if temperature_args and len(temperature_args) > 0:
             self.temperature = temperature_args[0]
@@ -2066,16 +2072,28 @@ class ReplicaFusionPipeline:
         
         if use_sam3_labels:
             # --- SAM3 SEMANTIC MODE: Use direct labels from text-prompted segmentation ---
-            print(f"{Log.GREEN}[Eval] Using SAM3 Semantic labels directly ({sam3_labeled_count}/{len(ordered_obj_ids)} objects){Log.END}")
+            print(f"{Log.GREEN}[Eval] Using SAM3 Semantic labels ({sam3_labeled_count}/{len(ordered_obj_ids)} objects){Log.END}")
+            
+            # --- SigLIP K-Pool Validation ---
+            validated_labels = self._validate_with_siglip_kpool(reduced_names)
             
             lookup_table = np.full(max(ordered_obj_ids) + 1 if ordered_obj_ids else 1, -1, dtype=np.int64)
             matched_count = 0
+            override_count = 0
             
-            # DEBUG: Log each object's class assignment
-            print(f"[Eval-Debug] Object -> Class mapping:")
+            print(f"[Eval-Debug] Object -> Class mapping (after validation):")
             for obj_id in ordered_obj_ids:
                 obj = self.semantic_mapper.objects[obj_id]
-                class_idx = obj.semantic_class_idx
+                sam3_class = obj.semantic_class_idx
+                
+                # Use validated label if available, otherwise fall back to SAM3
+                if obj_id in validated_labels:
+                    class_idx = validated_labels[obj_id]
+                    if class_idx != sam3_class:
+                        override_count += 1
+                else:
+                    class_idx = sam3_class
+                
                 class_name = reduced_names[class_idx] if 0 <= class_idx < len(reduced_names) else f"INVALID({class_idx})"
                 n_pts = len(obj.points_ids) if hasattr(obj, 'points_ids') else 0
                 print(f"  ObjID {obj_id}: class_idx={class_idx} ({class_name}), pts={n_pts}")
@@ -2083,7 +2101,7 @@ class ReplicaFusionPipeline:
                     lookup_table[obj_id] = class_idx
                     matched_count += 1
             
-            print(f"[Eval] Assigned {matched_count} objects via SAM3 semantic labels.")
+            print(f"[Eval] Assigned {matched_count} objects ({override_count} overridden by SigLIP).")
         else:
             # --- CLIP MODE: Standard similarity-based classification ---
             print(f"[Eval] Running CLIP Classification via Semantic Mapper Query on {len(reduced_names)} classes...")
@@ -2457,6 +2475,221 @@ class ReplicaFusionPipeline:
             print(f"\n[VoteDiag] Detailed log saved to: {log_path}")
         print(f"{Log.HEADER}======================================{Log.END}\n")
 
+    def _validate_with_siglip_kpool(self, class_names: list) -> dict:
+        """
+        SigLIP K-Pool Validation: Override SAM3's classification using SigLIP
+        against the pool of classes that SAM3 has voted for.
+        
+        For each object:
+          1. Get all classes SAM3 voted for (the K-pool)
+          2. Compute SigLIP similarity against ONLY those classes
+          3. Return SigLIP's pick as the validated class
+        
+        Returns:
+            dict: {obj_id: validated_class_idx} for all validated objects
+        """
+        validation_config = self.config.get("siglip_validation", {})
+        enabled = validation_config.get("enabled", True)
+        override_mode = validation_config.get("override_mode", "smart")
+        min_votes = validation_config.get("min_votes", 3)
+        min_keyframes = validation_config.get("min_keyframes", 3)  # Filter noisy single-frame objects
+        min_siglip_conf = validation_config.get("min_siglip_conf", 0.50)  # For K-pool mode
+        temperature = validation_config.get("temperature", 0.1)  # For K-pool mode
+        
+        if not enabled or override_mode == "disabled":
+            print(f"[SigLIP-Val] Validation disabled, using SAM3 labels directly")
+            return {}
+        
+        print(f"\n{Log.HEADER}=== SIGLIP K-POOL VALIDATION ==={Log.END}")
+        print(f"[SigLIP-Val] Mode: {override_mode}, Min votes: {min_votes}")
+        print(f"[SigLIP-Val] Min SigLIP conf: {min_siglip_conf}")
+        print(f"[SigLIP-Val] Temperature: {temperature}")
+        
+        # Debug: Print SigLIP scaling parameters
+        if hasattr(self.semantic_mapper, 'clip_generator'):
+            cg = self.semantic_mapper.clip_generator
+            if cg.siglip and len(cg.similarity_args) == 2:
+                scale, bias = cg.similarity_args
+                print(f"[SigLIP-Val] Scale: {scale.item():.4f} (exp={scale.exp().item():.4f}), Bias: {bias.item():.4f}")
+        
+        validated_labels = {}
+        validation_stats = {
+            "total": 0, "validated": 0, "overrides": 0, "agreements": 0,
+            "skipped_no_clip": 0, "skipped_no_votes": 0, "skipped_few_keyframes": 0
+        }
+        validation_log = []
+        
+        for obj_id, obj in self.semantic_mapper.objects.items():
+            validation_stats["total"] += 1
+            
+            sam3_class = obj.semantic_class_idx
+            sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
+            total_votes = sum(sam3_votes.values())
+            
+            if total_votes < min_votes:
+                validation_stats["skipped_no_votes"] += 1
+                validated_labels[obj_id] = sam3_class
+                continue
+            
+            # Minimum keyframe filter - skip noisy single-frame objects
+            n_keyframes = len(obj.kfs_ids) if hasattr(obj, 'kfs_ids') else 0
+            if n_keyframes < min_keyframes:
+                validation_stats["skipped_few_keyframes"] += 1
+                validated_labels[obj_id] = sam3_class
+                continue
+            
+            if obj.clip_feature is None:
+                validation_stats["skipped_no_clip"] += 1
+                validated_labels[obj_id] = sam3_class
+                continue
+            
+            sam3_conf = sam3_votes.get(sam3_class, 0) / total_votes if total_votes > 0 else 0.0
+            
+            # K-pool mode: only use classes SAM3 voted for
+            candidate_indices = list(sam3_votes.keys())
+            candidate_names = [class_names[i] if 0 <= i < len(class_names) else f"idx_{i}" for i in candidate_indices]
+            
+            if len(candidate_indices) == 0:
+                validated_labels[obj_id] = sam3_class
+                continue
+            
+            try:
+                img_feat = obj.clip_feature.to(self.device).float()
+                img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                
+                # Use RAW COSINE SIMILARITY (not sigmoid-scaled)
+                # This gives interpretable 0-1 range instead of SigLIP's sharp transitions
+                cg = self.semantic_mapper.clip_generator
+                
+                # Compute ensemble text embeddings (mean across 80 templates per class)
+                n_cands = len(candidate_names)
+                txt_embeds = torch.zeros((n_cands, img_feat.shape[-1]), device=self.device)
+                for j, name in enumerate(candidate_names):
+                    # Format with all templates and mean-pool
+                    templated = [t.format(name.replace("-", " ")) for t in IMAGENET_TEMPLATES]
+                    embed = cg.get_txt_embedding(templated).mean(0, keepdim=True).float()
+                    txt_embeds[j] = torch.nn.functional.normalize(embed, p=2, dim=-1)
+                
+                # Raw cosine similarity (no sigmoid scaling)
+                if img_feat.dim() == 1:
+                    img_feat = img_feat.unsqueeze(0)
+                similarities = (img_feat @ txt_embeds.T).squeeze()
+                
+                # Handle edge case: single candidate (0-dim tensor after squeeze)
+                if similarities.dim() == 0:
+                    best_local_idx = 0
+                    siglip_conf = 1.0  # Only one candidate = 100% confident
+                    raw_sim = similarities.item()
+                else:
+                    # Apply softmax temperature scaling for relative confidence
+                    probs = torch.softmax(similarities / temperature, dim=0)
+                    best_local_idx = probs.argmax().item()
+                    siglip_conf = probs[best_local_idx].item()  # Now 0-1 relative confidence
+                    raw_sim = similarities[best_local_idx].item()
+                
+                siglip_class = candidate_indices[best_local_idx]
+                
+            except Exception as e:
+                print(f"[SigLIP-Val] Error validating obj {obj_id}: {e}")
+                validated_labels[obj_id] = sam3_class
+                continue
+            
+            # Decide whether to override based on mode
+            should_override = False
+            override_reason = ""
+            
+            if override_mode == "always":
+                should_override = (siglip_class != sam3_class)
+                override_reason = "always_mode"
+            
+            elif override_mode == "simple":
+                # Two-tier override logic:
+                # 1. SigLIP > 60% → override regardless of SAM3 (high confidence)
+                # 2. SigLIP > 25% AND SAM3 < 80% → override (medium confidence + weak SAM3)
+                if siglip_class != sam3_class:
+                    if siglip_conf > 0.60:
+                        # High SigLIP confidence - trust SigLIP
+                        should_override = True
+                        override_reason = "siglip_confident"
+                    elif siglip_conf > 0.25 and sam3_conf < 0.80:
+                        # Medium SigLIP + weak SAM3
+                        should_override = True
+                        override_reason = "simple_override"
+                    elif siglip_conf <= 0.25:
+                        override_reason = f"siglip_low({siglip_conf:.2f})"
+                    else:
+                        override_reason = f"sam3_protected({sam3_conf:.0%})"
+            
+            elif override_mode == "disagreement":
+                if siglip_class != sam3_class and siglip_conf > sam3_conf:
+                    should_override = True
+                    override_reason = "disagreement_override"
+            
+            # Apply decision
+            if should_override:
+                final_class = siglip_class
+                validation_stats["overrides"] += 1
+            else:
+                final_class = sam3_class
+                validation_stats["agreements"] += 1
+            
+            validated_labels[obj_id] = final_class
+            validation_stats["validated"] += 1
+            
+            sam3_name = class_names[sam3_class] if 0 <= sam3_class < len(class_names) else f"idx_{sam3_class}"
+            siglip_name = class_names[siglip_class] if 0 <= siglip_class < len(class_names) else f"idx_{siglip_class}"
+            final_name = class_names[final_class] if 0 <= final_class < len(class_names) else f"idx_{final_class}"
+            # Build K-pool string from SAM3 votes (not full-class indices)
+            kpool_indices = list(sam3_votes.keys())
+            cand_dist = ", ".join([f"{class_names[idx]}:{sam3_votes[idx]}" for idx in kpool_indices[:5]])
+            
+            validation_log.append({
+                "obj_id": obj_id,
+                "n_points": len(obj.points_ids) if hasattr(obj, 'points_ids') else 0,
+                "sam3_class": sam3_name, "sam3_conf": sam3_conf,
+                "siglip_class": siglip_name, "siglip_conf": siglip_conf,
+                "final_class": final_name,
+                "overridden": siglip_class != sam3_class and final_class == siglip_class,
+                "candidates": cand_dist
+            })
+        
+        print(f"\n[SigLIP-Val] Results:")
+        print(f"  Total objects:     {validation_stats['total']}")
+        print(f"  Validated:         {validation_stats['validated']}")
+        print(f"  Overrides:         {validation_stats['overrides']}")
+        print(f"  Agreements:        {validation_stats['agreements']}")
+        print(f"  Skipped (no CLIP): {validation_stats['skipped_no_clip']}")
+        
+        overrides = [e for e in validation_log if e["overridden"]]
+        if overrides:
+            print(f"\n[SigLIP-Val] OVERRIDES ({len(overrides)}):")
+            for e in overrides[:15]:
+                print(f"  ID {e['obj_id']:3d}: SAM3={e['sam3_class']:12s} ({e['sam3_conf']:.1%}) -> SigLIP={e['siglip_class']:12s} ({e['siglip_conf']:.2f})")
+        
+        if hasattr(self, 'output_dir') and self.output_dir:
+            log_path = os.path.join(self.output_dir, "siglip_validation.txt")
+            with open(log_path, "w") as f:
+                f.write("SIGLIP K-POOL VALIDATION LOG\n")
+                f.write("=" * 70 + "\n\n")
+                f.write(f"Mode: {override_mode}, Min Votes: {min_votes}\n")
+                f.write(f"Min SigLIP Conf: {min_siglip_conf}, Temperature: {temperature}\n\n")
+                f.write(f"Total: {validation_stats['total']}, Validated: {validation_stats['validated']}\n")
+                f.write(f"Overrides: {validation_stats['overrides']}, Agreements: {validation_stats['agreements']}\n\n")
+                f.write("=" * 70 + "\n\n")
+                
+                for e in sorted(validation_log, key=lambda x: -x['n_points']):
+                    status = "OVERRIDE" if e['overridden'] else "AGREE"
+                    f.write(f"Object ID: {e['obj_id']} [{status}]\n")
+                    f.write(f"  Points: {e['n_points']:,}\n")
+                    f.write(f"  SAM3:   {e['sam3_class']} (conf: {e['sam3_conf']:.1%})\n")
+                    f.write(f"  SigLIP: {e['siglip_class']} (conf: {e['siglip_conf']:.3f})\n")
+                    f.write(f"  Final:  {e['final_class']}\n")
+                    f.write(f"  K-Pool: [{e['candidates']}]\n\n")
+            print(f"[SigLIP-Val] Detailed log saved to: {log_path}")
+        
+        print(f"{Log.HEADER}================================{Log.END}\n")
+        return validated_labels
+
 def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode="ensemble", mask_mode="sam3", output_dir=None, script_dir=None):
     # 1. Output Directory Logic
     if output_dir is None:
@@ -2492,7 +2725,6 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         return None
 
     # 4. Setup Mask Generator (Internally constructed)
-    # We resolve the weights path using the passed script_dir
     weights_path = os.path.join(script_dir, "weights", "mobile_sam.pt") if script_dir else "weights/mobile_sam.pt"
     sam3_weights = os.path.join(script_dir, "weights", "sam3.pt") if script_dir else "weights/sam3.pt"
 
@@ -2501,7 +2733,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         "masks_base_path": os.path.join(project_root, "masks"),
         "nms_iou_th": 0.8,
         "nms_score_th": 0.7,
-        "model_type": mask_mode,         # Passed argument: "mobile_sam", "sam3", or "sam3_semantic"
+        "model_type": mask_mode,
         "mobile_sam_weights": weights_path,
         "sam3_weights": sam3_weights
     }
@@ -2525,10 +2757,10 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
     # 6. Pipeline Config
     pipeline_config = {
         "sem_name": sem_cfg['name'],
-        "max_frames": 500,
+        "max_frames": 2000,
         "mapping": { 
             "map_every": 10, 
-            "downscale_ratio": 3,       # Balance: 3 for accuracy (was 4 for speed)
+            "downscale_ratio": 3,
             "k_pooling": 3,            
             "max_frame_points": 80000,  # More points for accuracy
             "max_total_points": 500000, # Allow larger point cloud
@@ -2536,27 +2768,39 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         },
         "tracking": { "track_every": 1 },
         "semantic": { "segment_every": 10 },
-        "track_th": 100,  
-        "th_centroid": 1.0,      # Tighter: 1.0m (was 1.5m)
-        "th_cossim": 0.88,       # Stricter: require higher semantic similarity for fusion
+        "track_th": 100,
+        "th_centroid": 1.5,
+        "th_cossim": 0.80,
         "match_distance_th": 0.05,
         "clip": { 
             "embed_type": "fused", 
             "k_top_views": 10, 
             "mask_res": 384
         },
-        "sam": { "mask_res": 384, "nms_iou_th": 0.6, "nms_score_th": 0.7 },
+        "sam": { "mask_res": 384, "nms_iou_th": 0.5, "nms_score_th": 0.8 },
         "detailed_logging": False,
-        "vis": { "stream": False }
+        "vis": { "stream": False },
+        "siglip_validation": {
+            "enabled": True,
+            "override_mode": "simple",     # "always" | "smart" | "simple" | "disabled"
+            "min_votes": 3,                # Require more votes for stable K-pool
+            "min_keyframes": 5,            # Filter noisy single-frame objects
+            "min_siglip_conf": 0.50,       # SigLIP must be this confident to override
+            "temperature": 0.1,            # Softmax temperature for K-pool
+        },
+        "output_dir": output_dir, # <--- Passed here
+        "device": DEVICE
     }
 
-    # 7. Initialize Pipeline with the specific Output Directory
+    # 7. Instantiate Pipeline
     pipeline = ReplicaFusionPipeline(
-        scene, pipeline_config, loader, 
-        output_dir=output_dir, # <--- Passed here
+        scene,
+        pipeline_config,
+        loader,
+        output_dir=output_dir,
         device=DEVICE
     )
-    
+
     # 8. Run
     result = pipeline.run(mask_gen, pipeline.classifier, detailed_logging_enabled=pipeline_config.get("detailed_logging", False))
 
@@ -2594,6 +2838,8 @@ def main():
     CLASSES = ["object"] 
     # SCENES = ["office1", "office2", "office3", "office4", "room0", "room1", "room2"]
     SCENES = ["office1"]
+    # SCENES = ["office4"]
+    SCENES = ["office1", "office4"]
 
     if os.path.exists(eval_config_path):
         print(f"[Global] Loading configuration from {eval_config_path}")
@@ -2627,9 +2873,11 @@ def main():
     global _SEMANTIC_CACHE
     if '_SEMANTIC_CACHE' not in globals(): _SEMANTIC_CACHE = {}
 
+    # Switch between siglip and siglip2 by changing which config is in the list
+    # To test SigLIP 2: use "siglip2" instead of "siglip"
     SEMANTIC_CONFIGS = [
         {
-            "name": "siglip",
+            "name": "siglip2", # Change to "siglip2" to test SigLIP 2
             "kind": "dual_encoder",
             "model_id": "google/siglip-so400m-patch14-224",
         },
