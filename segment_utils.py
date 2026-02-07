@@ -45,7 +45,7 @@ class CLIPGenerator(nn.Module):
         self.backbone.model.to(self.device).eval()
 
         # --- SigLIP Parameters ---
-        self.siglip = (self.backbone.name == "siglip")
+        self.siglip = (self.backbone.name in ["siglip", "siglip2"])
         self.similarity_args = ()
         
         if self.siglip:

@@ -115,6 +115,25 @@ def load_semantic_backbone(name: str, device: str = DEVICE) -> SemanticBackbone:
         
         return wrapper
 
+    if name == "siglip2":
+        # SigLIP 2: Improved version with better zero-shot performance
+        # Architecture: ViT-SO400M-14-SigLIP2-378 (378px, same params as siglip v1)
+        card = "hf-hub:timm/ViT-SO400M-14-SigLIP2-378"
+        model, preprocess = open_clip.create_model_from_pretrained(
+            card,
+            precision="fp32",
+        )
+        tokenizer = open_clip.get_tokenizer(card)
+        model = model.to(device).eval()
+        print("[Backbone] Loaded SigLIP2 via open_clip:", card)
+        
+        wrapper = SemanticBackbone("siglip2", model, preprocess, tokenizer, device)
+        
+        # SigLIP2 SO400M output dimension is 1152 (same as v1)
+        wrapper.embed_dim = 1152 
+        
+        return wrapper
+
     if name == "clip":
         # Baseline: ViT-L/14, LAION2B
         card = "hf-hub:laion/CLIP-ViT-L-14-laion2B-s32B-b82K"
