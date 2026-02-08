@@ -39,14 +39,27 @@ def compute_replica_text_embeddings(backbone, device, all_labels):
 
     return text_emb_dict
 
-def load_replica_text_embeddings(backbone, device, class_names, cache_path=None, prompt_mode='ensemble'):
+def load_replica_text_embeddings(backbone, device, class_names, cache_path=None, prompt_mode='ensemble', llm_prompts=None):
     """
-    Loads text embeddings with a selectable prompt mode ('handcrafted' or 'ensemble').
+    Loads text embeddings with a selectable prompt mode ('handcrafted', 'ensemble', or 'llm').
+    
+    Args:
+        backbone: SemanticBackbone instance
+        device: torch device
+        class_names: List of class names
+        cache_path: Path to cache file (optional)
+        prompt_mode: One of 'ensemble', 'handcrafted', 'llm'
+        llm_prompts: Dictionary of LLM-generated prompts (required for mode='llm')
     """
     
     # 1. STRICT VALIDATION (Respects mode)
     print(f" > Validating prompt dictionary against {len(class_names)} dataset classes (Mode: {prompt_mode})...")
-    validate_prompt_keys(class_names, mode=prompt_mode)
+    if prompt_mode != 'llm':
+        validate_prompt_keys(class_names, mode=prompt_mode)
+    else:
+        if llm_prompts is None:
+            raise ValueError("llm_prompts dict required when prompt_mode='llm'")
+        print(f" > Using LLM-generated prompts ({len(llm_prompts)} classes available)")
 
     # 2. Check Cache
     # Note: We assume the cache file corresponds to the requested mode. 
@@ -69,8 +82,8 @@ def load_replica_text_embeddings(backbone, device, class_names, cache_path=None,
     with torch.no_grad():
         for label in tqdm(class_names, desc=f"Encoding ({prompt_mode})"):
             
-            # PASS THE MODE HERE
-            prompts = get_prompts(label, mode=prompt_mode)
+            # PASS THE MODE AND LLM_PROMPTS HERE
+            prompts = get_prompts(label, mode=prompt_mode, llm_prompts=llm_prompts)
             
             if not prompts:
                 prompts = [f"a photo of a {label}"]

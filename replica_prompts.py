@@ -421,11 +421,35 @@ def validate_prompt_keys(valid_classes: list, mode: str = 'ensemble'):
     else:
         print("[Info] Strict Prompt Validation Passed: All prompts map to valid classes.")
         
-def get_prompts(label: str, mode: str = 'ensemble'):
+def get_prompts(label: str, mode: str = 'ensemble', llm_prompts: dict = None):
     """
     Returns list of prompts for a given label based on the selected mode.
+    
+    Args:
+        label: Class label
+        mode: One of 'ensemble', 'handcrafted', 'llm'
+        llm_prompts: Dictionary of LLM-generated prompts (required for mode='llm')
     """
-    if mode == "handcrafted":
+    if mode == "llm":
+        # Use LLM-generated prompts
+        if llm_prompts is None:
+            raise ValueError("llm_prompts dict required when mode='llm'")
+        
+        if label in llm_prompts:
+            return llm_prompts[label]
+        
+        # Try normalized label
+        normalized = label.replace("_", "-").lower()
+        if normalized in llm_prompts:
+            return llm_prompts[normalized]
+        
+        # Fallback to handcrafted if LLM prompt not available
+        print(f"[Warning] No LLM prompt for '{label}', falling back to handcrafted")
+        if label in REPLICA_PROMPTS:
+            return REPLICA_PROMPTS[label]
+        return [t.format(label.replace("-", " ")) for t in IMAGENET_TEMPLATES]
+    
+    elif mode == "handcrafted":
         if label in REPLICA_PROMPTS:
             return REPLICA_PROMPTS[label]
         
