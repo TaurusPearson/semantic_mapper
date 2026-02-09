@@ -99,7 +99,9 @@ class SLAMMapper():
         if self.pcd.shape[0] > self.max_total_points:
             self._downsample_pointcloud()
 
-        self.map_updated = True
+        # NOTE: Do NOT set map_updated=True here. OVO's vanilla mapper never does.
+        # update_map() is expensive O(n²) instance fusion — only meant for SLAM loop closures.
+        # self.map_updated = True
             
     def _downsample_pointcloud(self):
         """Voxel-based downsampling to limit point cloud size"""
