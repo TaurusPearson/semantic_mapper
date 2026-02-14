@@ -2096,42 +2096,43 @@ class ReplicaFusionPipeline:
         """
         map_to_reduced = {}
         
-        # 1. Try ScanNet config first
-        scannet_config_paths = [
-            Path(__file__).parent / "scannet200.yaml",
-            Path(__file__).parent / "scannet20.yaml",
-        ]
-        for cfg_path in scannet_config_paths:
-            if cfg_path.exists():
-                with open(cfg_path, 'r') as f:
-                    scannet_cfg = yaml.safe_load(f)
-                if "valid_class_ids" in scannet_cfg and "class_names_reduced" in scannet_cfg:
-                    # If scannet200_gt txt files exist, use map_to_reduced from YAML
-                    # (maps fine-grained ScanNet200 IDs → reduced indices 0-199)
-                    if "map_to_reduced" in scannet_cfg:
-                        map_to_reduced = {int(k): int(v) for k, v in scannet_cfg["map_to_reduced"].items()}
-                        print(f"[GT] Using YAML map_to_reduced: {len(map_to_reduced)} entries (fine-grained → reduced)")
+        if isinstance(self.loader, ScanNet):
+            # ScanNet: Try scannet200.yaml / scannet20.yaml
+            scannet_config_paths = [
+                Path(__file__).parent / "scannet200.yaml",
+                Path(__file__).parent / "scannet20.yaml",
+            ]
+            for cfg_path in scannet_config_paths:
+                if cfg_path.exists():
+                    with open(cfg_path, 'r') as f:
+                        scannet_cfg = yaml.safe_load(f)
+                    if "valid_class_ids" in scannet_cfg and "class_names_reduced" in scannet_cfg:
+                        if "map_to_reduced" in scannet_cfg:
+                            map_to_reduced = {int(k): int(v) for k, v in scannet_cfg["map_to_reduced"].items()}
+                            print(f"[GT] Using ScanNet YAML map_to_reduced: {len(map_to_reduced)} entries")
+                            return map_to_reduced
+                        
+                        valid_ids = scannet_cfg["valid_class_ids"]
+                        full_class_names = scannet_cfg["class_names_reduced"]
+                        class_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
+                        for raw_id, full_class_name in zip(valid_ids, full_class_names):
+                            if full_class_name in class_name_to_idx:
+                                map_to_reduced[raw_id] = class_name_to_idx[full_class_name]
+                        print(f"[GT] Built ScanNet ID mapping: {len(map_to_reduced)} classes")
                         return map_to_reduced
-                    
-                    # Fallback: Build mapping from valid_class_ids + class_names_reduced
-                    valid_ids = scannet_cfg["valid_class_ids"]
-                    full_class_names = scannet_cfg["class_names_reduced"]
-                    class_name_to_idx = {name: idx for idx, name in enumerate(class_names)}
-                    for raw_id, full_class_name in zip(valid_ids, full_class_names):
-                        if full_class_name in class_name_to_idx:
-                            map_to_reduced[raw_id] = class_name_to_idx[full_class_name]
-                    print(f"[GT] Built ScanNet ID mapping: {len(map_to_reduced)} classes")
-                    return map_to_reduced
-        
-        # 2. Fallback to Replica eval_info.yaml
-        eval_config_path = "eval_info.yaml"
-        if not os.path.exists(eval_config_path):
-            eval_config_path = os.path.join(self.loader.dataset_path, "eval_info.yaml")
-        if os.path.exists(eval_config_path):
-            with open(eval_config_path, 'r') as f:
-                eval_cfg = yaml.safe_load(f)
-            map_to_reduced = eval_cfg.get("map_to_reduced", {})
-            print(f"[GT] Loaded Replica ID mapping: {len(map_to_reduced)} classes")
+        else:
+            # Replica: Use eval_info.yaml
+            candidates = [
+                "eval_info.yaml",
+                os.path.join(str(self.loader.dataset_path), "eval_info.yaml"),
+                str(Path(__file__).parent / "eval_info.yaml"),
+            ]
+            eval_config_path = next((p for p in candidates if os.path.exists(p)), None)
+            if eval_config_path:
+                with open(eval_config_path, 'r') as f:
+                    eval_cfg = yaml.safe_load(f)
+                map_to_reduced = {int(k): int(v) for k, v in eval_cfg.get("map_to_reduced", {}).items()}
+                print(f"[GT] Loaded Replica ID mapping: {len(map_to_reduced)} entries")
         
         return map_to_reduced
 
@@ -3407,6 +3408,7 @@ def main():
         cam_config_path = os.path.join(script_dir, "replica.yaml")
         SCENES = ["office1", "office4"]  # Default Replica scenes
         SCENES = ["office0", "office2", "office3", "room0", "room1", "room2"]
+        SCENES = ["room2"]
     elif CURRENT_DATASET == "scannet20":
         eval_config_path = os.path.join(script_dir, "scannet20.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
