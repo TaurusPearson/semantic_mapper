@@ -3331,9 +3331,9 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         "siglip_validation": {
             "enabled": True,
             "override_mode": "simple",     # "always" | "smart" | "simple" | "disabled"
-            "min_votes": 3,                # Require more votes for stable K-pool
-            "min_keyframes": 5,            # Filter noisy single-frame objects
-            "min_siglip_conf": 0.50,       # SigLIP must be this confident to override
+            "min_votes": 1,                # Require more votes for stable K-pool
+            "min_keyframes": 1,            # Filter noisy single-frame objects
+            "min_siglip_conf": 0.50,       # Lower threshold allows more beneficial overrides (was 0.50)
             "temperature": 0.1,            # Softmax temperature for K-pool
         },
         "output_dir": output_dir, # <--- Passed here
@@ -3407,6 +3407,7 @@ def main():
         cam_config_path = os.path.join(script_dir, "replica.yaml")
         SCENES = ["office1", "office4"]  # Default Replica scenes
         SCENES = ["office0", "office2", "office3", "room0", "room1", "room2"]
+        SCENES = ["office1"]
     elif CURRENT_DATASET == "scannet20":
         eval_config_path = os.path.join(script_dir, "scannet20.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
@@ -3415,6 +3416,7 @@ def main():
         eval_config_path = os.path.join(script_dir, "scannet200.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
         SCENES = ["scene0011_00", "scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
+        SCENES = ["scene0011_00"]
     else:
         print(f"[Error] Unknown dataset: {CURRENT_DATASET}")
         return
@@ -3502,7 +3504,6 @@ def main():
         backbone_name = sem['name']
         
         # STRUCTURE: results / backbone / mask_mode / prompt_mode
-        # Example: results/siglip/mobile_sam/ensemble/
         experiment_dir = os.path.join(
             RESULTS_DIR, 
             backbone_name, 
