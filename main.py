@@ -2944,20 +2944,21 @@ class ReplicaFusionPipeline:
         """
         validation_config = self.config.get("siglip_validation", {})
         enabled = validation_config.get("enabled", True)
-        override_mode = validation_config.get("override_mode", "smart")
         min_votes = validation_config.get("min_votes", 3)
         min_keyframes = validation_config.get("min_keyframes", 3)  # Filter noisy single-frame objects
         min_siglip_conf = validation_config.get("min_siglip_conf", 0.50)  # For K-pool mode
         temperature = validation_config.get("temperature", 0.1)  # For K-pool mode
+        synonym_threshold = validation_config.get("synonym_threshold", 0.85)  # Text-embed cosine sim to detect synonyms
         
-        if not enabled or override_mode == "disabled":
+        if not enabled:
             print(f"[SigLIP-Val] Validation disabled, using SAM3 labels directly")
             return {}
         
         print(f"\n{Log.HEADER}=== SIGLIP K-POOL VALIDATION ==={Log.END}")
-        print(f"[SigLIP-Val] Mode: {override_mode}, Min votes: {min_votes}")
+        print(f"[SigLIP-Val] Min votes: {min_votes}")
         print(f"[SigLIP-Val] Min SigLIP conf: {min_siglip_conf}")
         print(f"[SigLIP-Val] Temperature: {temperature}")
+        print(f"[SigLIP-Val] Synonym threshold: {synonym_threshold}")
         
         # Debug: Print SigLIP scaling parameters
         if hasattr(self.semantic_mapper, 'clip_generator'):
@@ -2969,7 +2970,8 @@ class ReplicaFusionPipeline:
         validated_labels = {}
         validation_stats = {
             "total": 0, "validated": 0, "overrides": 0, "agreements": 0,
-            "skipped_no_clip": 0, "skipped_no_votes": 0, "skipped_few_keyframes": 0
+            "skipped_no_clip": 0, "skipped_no_votes": 0, "skipped_few_keyframes": 0,
+            "synonym_overrides": 0
         }
         validation_log = []
         
@@ -3052,44 +3054,43 @@ class ReplicaFusionPipeline:
                 
                 siglip_class = candidate_indices[best_local_idx]
                 
+                # Compute text-embedding similarity between SAM3's pick and SigLIP's pick
+                # for synonym detection (no hardcoded alias maps needed)
+                text_sim = 0.0
+                if siglip_class != sam3_class and sam3_class in candidate_indices:
+                    sam3_local_idx = candidate_indices.index(sam3_class)
+                    text_sim = (txt_embeds[sam3_local_idx] @ txt_embeds[best_local_idx]).item()
+                
             except Exception as e:
                 print(f"[SigLIP-Val] Error validating obj {obj_id}: {e}")
                 validated_labels[obj_id] = sam3_class
                 continue
             
-            # Decide whether to override based on mode
+            # Decide whether to override
+            # Three-tier logic:
+            # 0. Synonym: SAM3 & SigLIP picks are near-synonyms → trust SigLIP (any confidence)
+            # 1. SigLIP > 60% → override regardless of SAM3 (high confidence)
+            # 2. SigLIP > min_siglip_conf AND SAM3 < 80% → override (medium confidence + weak SAM3)
             should_override = False
             override_reason = ""
             
-            if override_mode == "always":
-                should_override = (siglip_class != sam3_class)
-                override_reason = "always_mode"
-            
-            elif override_mode == "simple":
-                # Two-tier override logic:
-                # 1. SigLIP > 60% → override regardless of SAM3 (high confidence)
-                # 2. SigLIP > min_siglip_conf AND SAM3 < 80% → override (medium confidence + weak SAM3)
-                if siglip_class != sam3_class:
-                    # Fix #1: Never override TO the catch-all "object" class
-                    if siglip_class == object_class_idx:
-                        override_reason = "blocked_object_override"
-                    elif siglip_conf > 0.60:
-                        # High SigLIP confidence - trust SigLIP
-                        should_override = True
-                        override_reason = "siglip_confident"
-                    elif siglip_conf > min_siglip_conf and sam3_conf < 0.80:
-                        # Fix #2: Use min_siglip_conf (default 0.50) instead of hardcoded 0.25
-                        should_override = True
-                        override_reason = "simple_override"
-                    elif siglip_conf <= min_siglip_conf:
-                        override_reason = f"siglip_low({siglip_conf:.2f})"
-                    else:
-                        override_reason = f"sam3_protected({sam3_conf:.0%})"
-            
-            elif override_mode == "disagreement":
-                if siglip_class != sam3_class and siglip_conf > sam3_conf:
+            if siglip_class != sam3_class:
+                if siglip_class == object_class_idx:
+                    override_reason = "blocked_object_override"
+                elif text_sim >= synonym_threshold:
                     should_override = True
-                    override_reason = "disagreement_override"
+                    override_reason = f"synonym_override(sim={text_sim:.3f})"
+                    validation_stats["synonym_overrides"] += 1
+                elif siglip_conf > 0.60:
+                    should_override = True
+                    override_reason = "siglip_confident"
+                elif siglip_conf > min_siglip_conf and sam3_conf < 0.80:
+                    should_override = True
+                    override_reason = "simple_override"
+                elif siglip_conf <= min_siglip_conf:
+                    override_reason = f"siglip_low({siglip_conf:.2f})"
+                else:
+                    override_reason = f"sam3_protected({sam3_conf:.0%})"
             
             # Apply decision
             if should_override:
@@ -3116,13 +3117,15 @@ class ReplicaFusionPipeline:
                 "siglip_class": siglip_name, "siglip_conf": siglip_conf,
                 "final_class": final_name,
                 "overridden": siglip_class != sam3_class and final_class == siglip_class,
+                "override_reason": override_reason,
+                "text_sim": text_sim,
                 "candidates": cand_dist
             })
         
         print(f"\n[SigLIP-Val] Results:")
         print(f"  Total objects:     {validation_stats['total']}")
         print(f"  Validated:         {validation_stats['validated']}")
-        print(f"  Overrides:         {validation_stats['overrides']}")
+        print(f"  Overrides:         {validation_stats['overrides']} (synonym: {validation_stats['synonym_overrides']})")
         print(f"  Agreements:        {validation_stats['agreements']}")
         print(f"  Skipped (no CLIP): {validation_stats['skipped_no_clip']}")
         
@@ -3130,17 +3133,21 @@ class ReplicaFusionPipeline:
         if overrides:
             print(f"\n[SigLIP-Val] OVERRIDES ({len(overrides)}):")
             for e in overrides[:15]:
-                print(f"  ID {e['obj_id']:3d}: SAM3={e['sam3_class']:12s} ({e['sam3_conf']:.1%}) -> SigLIP={e['siglip_class']:12s} ({e['siglip_conf']:.2f})")
+                reason = e.get('override_reason', '')
+                sim_str = f" [txt_sim={e['text_sim']:.3f}]" if e.get('text_sim', 0) > 0 else ""
+                print(f"  ID {e['obj_id']:3d}: SAM3={e['sam3_class']:12s} ({e['sam3_conf']:.1%}) -> SigLIP={e['siglip_class']:12s} ({e['siglip_conf']:.2f}) {reason}{sim_str}")
         
         if hasattr(self, 'output_dir') and self.output_dir:
             log_path = os.path.join(self.output_dir, "siglip_validation.txt")
             with open(log_path, "w") as f:
                 f.write("SIGLIP K-POOL VALIDATION LOG\n")
                 f.write("=" * 70 + "\n\n")
-                f.write(f"Mode: {override_mode}, Min Votes: {min_votes}\n")
-                f.write(f"Min SigLIP Conf: {min_siglip_conf}, Temperature: {temperature}\n\n")
+                f.write(f"Min Votes: {min_votes}\n")
+                f.write(f"Min SigLIP Conf: {min_siglip_conf}, Temperature: {temperature}\n")
+                f.write(f"Synonym Threshold: {synonym_threshold}\n\n")
                 f.write(f"Total: {validation_stats['total']}, Validated: {validation_stats['validated']}\n")
-                f.write(f"Overrides: {validation_stats['overrides']}, Agreements: {validation_stats['agreements']}\n\n")
+                f.write(f"Overrides: {validation_stats['overrides']}, Agreements: {validation_stats['agreements']}\n")
+                f.write(f"Synonym Overrides: {validation_stats['synonym_overrides']}\n\n")
                 f.write("=" * 70 + "\n\n")
                 
                 for e in sorted(validation_log, key=lambda x: -x['n_points']):
@@ -3149,6 +3156,10 @@ class ReplicaFusionPipeline:
                     f.write(f"  Points: {e['n_points']:,}\n")
                     f.write(f"  SAM3:   {e['sam3_class']} (conf: {e['sam3_conf']:.1%})\n")
                     f.write(f"  SigLIP: {e['siglip_class']} (conf: {e['siglip_conf']:.3f})\n")
+                    if e.get('text_sim', 0) > 0:
+                        f.write(f"  Text Sim: {e['text_sim']:.3f}\n")
+                    if e.get('override_reason'):
+                        f.write(f"  Reason: {e['override_reason']}\n")
                     f.write(f"  Final:  {e['final_class']}\n")
                     f.write(f"  K-Pool: [{e['candidates']}]\n\n")
             print(f"[SigLIP-Val] Detailed log saved to: {log_path}")
@@ -3298,7 +3309,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "voxel_size": 0.02          # 2cm voxel grid (finer)
         },
         "tracking": { "track_every": 1 },
-        "semantic": { "segment_every": 7 },
+        "semantic": { "segment_every": 10 },
         "track_th": 75,
         "th_centroid": 1.5,
         "th_cossim": 0.80,
@@ -3314,11 +3325,11 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         "vis": { "stream": False },
         "siglip_validation": {
             "enabled": True,
-            "override_mode": "simple",     # "always" | "smart" | "simple" | "disabled"
             "min_votes": 3,                # Require more votes for stable K-pool
             "min_keyframes": 5,            # Filter noisy single-frame objects
             "min_siglip_conf": 0.5,       # SigLIP must be this confident to override
             "temperature": 0.1,            # Softmax temperature for K-pool
+            "synonym_threshold": 0.86,     # Text-embed cosine sim to detect near-synonyms
         },
         "output_dir": output_dir, # <--- Passed here
         "device": DEVICE
