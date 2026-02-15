@@ -62,6 +62,52 @@ class SemanticBackbone:
         feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-6)
         return feats
 
+    # -------------------- DENSE IMAGE ENCODING ---------------------- #
+    @torch.no_grad()
+    def encode_image_dense(self, image_rgb):
+        """
+        Return (patch_tokens, global_cls):
+          - patch_tokens: (1, N_patches, D) L2-normalised patch-level features
+          - global_cls:   (1, D) L2-normalised CLS token (text-aligned, through full model head)
+        Requires a timm-based visual encoder (SigLIP/SigLIP2).
+        """
+        if isinstance(image_rgb, np.ndarray):
+            pil = Image.fromarray(image_rgb.astype("uint8"))
+        elif isinstance(image_rgb, Image.Image):
+            pil = image_rgb
+        else:
+            raise ValueError(f"encode_image_dense expects np.ndarray or PIL.Image, got {type(image_rgb)}")
+
+        img_tensor = self.preprocess(pil).unsqueeze(0).to(self.device)  # (1, 3, H, W)
+
+        visual = self.model.visual
+        if not hasattr(visual, 'trunk'):
+            raise NotImplementedError("Dense features require timm-based visual encoder (SigLIP)")
+
+        # 1. Get pre-pooled patch tokens from ViT trunk (the expensive part)
+        patch_tokens = visual.trunk.forward_features(img_tensor)  # (1, N_patches, D_trunk)
+
+        # 2. Get global CLS via trunk's pooling + open_clip head (cheap)
+        pooled = visual.trunk.forward_head(patch_tokens)  # (1, D_trunk) — attention/avg pool
+        if hasattr(visual, 'head') and visual.head is not None:
+            global_cls = visual.head(pooled)  # (1, D) — projection to text space
+        else:
+            global_cls = pooled
+        global_cls = global_cls / (global_cls.norm(dim=-1, keepdim=True) + 1e-6)
+
+        # 3. Apply head projection to patch tokens (per-token)
+        if hasattr(visual, 'head') and visual.head is not None:
+            for module in visual.head.children():
+                if isinstance(module, torch.nn.Linear):
+                    patch_tokens = torch.nn.functional.linear(
+                        patch_tokens, module.weight, module.bias
+                    )
+                    break  # Only the first linear layer (projection)
+
+        # 4. L2 normalize each patch token
+        patch_tokens = patch_tokens / (patch_tokens.norm(dim=-1, keepdim=True) + 1e-6)
+        return patch_tokens, global_cls  # (1, N_patches, D), (1, D)
+
     # ------------------------ TEXT ENCODING ------------------------- #
     @torch.no_grad()
     def encode_text(self, texts):

@@ -1206,7 +1206,7 @@ class SemanticMapper:
         self.cam_intrinsics = cam_intrinsics
         self.config = config
         self.device = device
-        self.n_top_views = config["clip"].get("k_top_views", 8)  # Increased from 5 for better descriptor aggregation
+        self.n_top_views = config["clip"].get("k_top_views", 8)  # Top-K heap size for decoupled DBSCAN selection
         Instance3D.n_top_kf = self.n_top_views
 
         self.object_centroids = {}
@@ -1722,17 +1722,11 @@ class SemanticMapper:
 
             # 3. CRITICAL: Tell the object about this view!
             if ins_id in self.objects:
-                # This calls the method in your Instance3D code to update the heap
                 self.objects[ins_id].add_top_kf(kf_id, mask_area)
 
-            # 4. Filter: Do we keep this for CLIP processing?
-            # We only keep it if it's a Top View (or if Top-K is disabled by setting n=0)
-            if self.n_top_views <= 0 or self.objects[ins_id].is_top_kf(kf_id):
-                matched_ins_ids.append(ins_id)
-                maps_idxs.append(first_map_idx)
-            
-            # If it's NOT a top view, we silently drop it from the 'matched_ins_ids' list.
-            # This means it won't be sent to CLIP in the next step.
+            # 4. Decoupled approach: always keep ALL views for CLIP extraction.
+            matched_ins_ids.append(ins_id)
+            maps_idxs.append(first_map_idx)
 
         # Filter the binary_maps tensor to only include the ones we kept
         if len(maps_idxs) > 0:
@@ -1741,7 +1735,7 @@ class SemanticMapper:
             binary_maps = torch.empty((0, *binary_maps.shape[1:]), device=self.device, dtype=torch.bool)
 
         return matched_ins_ids, binary_maps
-    
+
     def _compute_semantic_info(self, data=None) -> None:
         if data is not None:
             matched_ins_ids, binary_maps, image, kf_id = data
@@ -1751,20 +1745,8 @@ class SemanticMapper:
             return
 
         if len(matched_ins_ids) > 0:
-            # --- THIS IS THE CRITICAL OPTIMIZATION ---
-            if self.n_top_views > 0:
-                obj_to_compute = []
-                for j, ins_id in enumerate(matched_ins_ids):
-                    # Only calculate CLIP if this is one of the "Best" views for this object
-                    if ins_id in self.objects and self.objects[ins_id].is_top_kf(kf_id):
-                        obj_to_compute.append(j)
-                
-                if len(obj_to_compute) == 0:
-                    return
-                
-                # Filter down to just the "Top K" objects
-                matched_ins_ids = np.asarray(matched_ins_ids)[obj_to_compute].tolist()
-                binary_maps = binary_maps[obj_to_compute]
+            # --- Decoupled approach: extract CLIP for ALL views ---
+            # Top-K selection happens in update_clip() for DBSCAN only.
 
             # --- OVO Spec III.3: Async CLIP Processing ---
             if self.use_async_clip and self.async_clip is not None:
@@ -1774,7 +1756,7 @@ class SemanticMapper:
                 # Synchronous fallback
                 clip_embeds = self._extract_clip(image, binary_maps).cpu()
                 self._update_matched_objects_clip(clip_embeds, matched_ins_ids, kf_id)
-    
+
     def collect_async_clip_results(self) -> int:
         """
         OVO Spec III.3: Collect completed async CLIP results.
@@ -3316,15 +3298,16 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "voxel_size": 0.02          # 2cm voxel grid (finer)
         },
         "tracking": { "track_every": 1 },
-        "semantic": { "segment_every": 10 },
-        "track_th": 100,
+        "semantic": { "segment_every": 7 },
+        "track_th": 75,
         "th_centroid": 1.5,
         "th_cossim": 0.80,
-        "match_distance_th": 0.05,
+        "match_distance_th": 0.03,
         "clip": { 
             "embed_type": "fused", 
             "k_top_views": 10, 
-            "mask_res": 384
+            "mask_res": 384,
+            "dense_features": True
         },
         "sam": { "mask_res": 384, "nms_iou_th": 0.5, "nms_score_th": 0.8 },
         "detailed_logging": False,
@@ -3334,7 +3317,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "override_mode": "simple",     # "always" | "smart" | "simple" | "disabled"
             "min_votes": 3,                # Require more votes for stable K-pool
             "min_keyframes": 5,            # Filter noisy single-frame objects
-            "min_siglip_conf": 0.50,       # SigLIP must be this confident to override
+            "min_siglip_conf": 0.5,       # SigLIP must be this confident to override
             "temperature": 0.1,            # Softmax temperature for K-pool
         },
         "output_dir": output_dir, # <--- Passed here
@@ -3408,7 +3391,7 @@ def main():
         cam_config_path = os.path.join(script_dir, "replica.yaml")
         SCENES = ["office1", "office4"]  # Default Replica scenes
         SCENES = ["office0", "office2", "office3", "room0", "room1", "room2"]
-        SCENES = ["room2"]
+        SCENES = ["office1"]
     elif CURRENT_DATASET == "scannet20":
         eval_config_path = os.path.join(script_dir, "scannet20.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config

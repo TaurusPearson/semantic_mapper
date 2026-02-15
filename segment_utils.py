@@ -67,6 +67,11 @@ class CLIPGenerator(nn.Module):
                     logit_bias = torch.tensor([logit_bias], device=self.device)
                 self.similarity_args = (logit_scale.to(self.device), logit_bias.to(self.device))
 
+        # --- Dense Feature Mode ---
+        self.use_dense = config.get("dense_features", False)
+        if self.use_dense:
+            print(f"[CLIPGenerator] Dense patch-pooled feature mode ENABLED")
+
     def cuda(self):
         self.backbone.model.to(self.device)
 
@@ -74,11 +79,86 @@ class CLIPGenerator(nn.Module):
         self.backbone.model.cpu()
 
     @torch.no_grad()
+    def extract_clip_dense(self, image: torch.Tensor, binary_maps: torch.Tensor) -> torch.Tensor:
+        """
+        Dense+CLS fusion feature extraction.
+        Encodes full image ONCE via ViT → patch tokens + global CLS.
+        Fuses text-aligned CLS (global context) with mask-pooled patches (object discrimination).
+        1 forward pass per frame instead of 2N+1.
+        """
+        N = binary_maps.shape[0]
+        if N == 0:
+            return torch.empty((0, self.clip_dim), device=self.device)
+
+        # 1. Get dense patch tokens + global CLS from full image (1 forward pass)
+        img_pil = Image.fromarray(image.permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8))
+        patch_tokens, global_cls = self.backbone.encode_image_dense(img_pil)
+        patch_tokens = patch_tokens.squeeze(0)  # (N_patches, D)
+        global_cls = global_cls.squeeze(0)      # (D,)
+
+        n_patches = patch_tokens.shape[0]
+        grid_size = int(round(n_patches ** 0.5))
+
+        if grid_size * grid_size != n_patches:
+            print(f"[Dense] Warning: non-square patch grid ({n_patches} patches), falling back to crop-based")
+            self.use_dense = False
+            result = self.extract_clip(image, binary_maps)
+            self.use_dense = True
+            return result
+
+        # 2. Downsample binary masks to patch grid resolution
+        masks_down = torch.nn.functional.interpolate(
+            binary_maps.float().unsqueeze(1),  # (N, 1, H, W)
+            size=(grid_size, grid_size),
+            mode='area'  # area mode = fraction of pixels covered
+        ).squeeze(1)  # (N, grid_size, grid_size)
+
+        masks_flat = masks_down.reshape(N, -1)  # (N, n_patches)
+
+        # 3. Mask-weighted mean pooling (threshold: >25% coverage)
+        masks_weight = (masks_flat > 0.25).float()
+        n_active = masks_weight.sum(dim=1)  # (N,)
+
+        # Batch matrix multiply: (N, n_patches) @ (n_patches, D) -> (N, D)
+        dense_embeds = masks_weight @ patch_tokens  # (N, D)
+
+        # Normalize by count
+        safe_count = n_active.clamp(min=1).unsqueeze(-1)  # (N, 1)
+        dense_embeds = dense_embeds / safe_count
+
+        # Fallback for masks with 0 active patches: use global CLS directly
+        no_patches = (n_active < 1)
+        if no_patches.any():
+            dense_embeds[no_patches] = global_cls.unsqueeze(0).expand(no_patches.sum(), -1)
+
+        # L2 normalize dense component
+        dense_embeds = dense_embeds / (dense_embeds.norm(dim=-1, keepdim=True) + 1e-6)
+
+        # 4. Adaptive fusion: weight CLS vs dense based on mask patch coverage
+        #    Large masks (many patches) → trust dense spatial features
+        #    Small masks (few patches)  → rely on text-aligned CLS
+        patch_ratio = n_active / n_patches                        # (N,) 0.0→1.0
+        w_dense = torch.clamp(patch_ratio * 4.0, min=0.2, max=0.8)  # (N,)
+        w_global = 1.0 - w_dense                                  # (N,)
+
+        global_expanded = global_cls.unsqueeze(0).expand(N, -1)   # (N, D)
+        embeddings = w_global.unsqueeze(-1) * global_expanded + w_dense.unsqueeze(-1) * dense_embeds
+
+        # 5. Final L2 normalize
+        embeddings = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-6)
+        return embeddings
+
+    @torch.no_grad()
     def extract_clip(self, image: torch.Tensor, binary_maps: torch.Tensor, return_all=False) -> torch.Tensor:
         """
         Computes Tri-View Fusion (Global + Mask + BBox).
         Uses the helper functions (segmap2segimg) provided in SOTA code.
+        Delegates to dense mode if configured.
         """
+        # --- Dense mode: single forward pass with patch pooling ---
+        if self.use_dense and not return_all:
+            return self.extract_clip_dense(image, binary_maps)
+
         N = binary_maps.shape[0]
         if N == 0:
             return torch.empty((0, self.clip_dim), device=self.device)

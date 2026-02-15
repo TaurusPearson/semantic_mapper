@@ -306,36 +306,37 @@ class Instance3D:
 
     def update_clip(self, keyframes_clips: Dict[int, Dict[int, torch.Tensor]], force_update: bool = False) -> None:
         if self.to_update or force_update:
-            # 1. Collect History (Keep on GPU!)
-            # We assume features in keyframes_clips are already on CUDA
-            new_history = []
-            
+            # 1. Collect features from ALL keyframes (preserve full viewpoint diversity)
+            all_features = []
+            all_kf_ids = []
             for kf in self.kfs_ids:
                 kf_clips = keyframes_clips.get(kf)
                 if kf_clips is not None and self.id in kf_clips:
                     feat = kf_clips[self.id]
-                    # Normalize immediately
                     feat = feat / (feat.norm() + 1e-6)
-                    new_history.append(feat) # List of Tensors
+                    all_features.append(feat)
+                    all_kf_ids.append(kf)
             
-            # Update internal history if needed, or just use local list
-            # If you want to persist history:
-            # self.feature_history.extend(new_history) 
-            # features_stack = torch.stack(self.feature_history)
-            
-            # Ideally for Top-K logic, you just rebuild from Top-K every time:
-            if not new_history:
+            if not all_features:
                 self.to_update = False
                 return
 
-            features_stack = torch.stack(new_history) # Shape [N, 512/1152] on GPU
+            # 2. Decoupled top-K selection: only use top-K features for DBSCAN
+            # CLIP was extracted from ALL views, but we cluster on the best subset
+            if self.n_top_kf > 0 and self.top_kf and len(all_features) > self.n_top_kf:
+                top_kf_ids = {kf for _, kf in heapq.nlargest(self.n_top_kf, self.top_kf)}
+                selected = [f for f, kf in zip(all_features, all_kf_ids) if kf in top_kf_ids]
+                if len(selected) >= 3:
+                    features_stack = torch.stack(selected)
+                else:
+                    features_stack = torch.stack(all_features)
+            else:
+                features_stack = torch.stack(all_features)
 
-            # 2. Run GPU Clustering
+            # 3. Run GPU Clustering
             if features_stack.shape[0] < 3:
-                # Too few points to cluster, just mean
                 self.clip_feature = features_stack.mean(dim=0)
             else:
-                # Run the custom Torch function
                 self.clip_feature = torch_semantic_clustering(features_stack, eps=0.20, min_samples=3)
 
             # Re-normalize final result
