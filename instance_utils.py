@@ -83,13 +83,17 @@ def fuse_instances(instance1, instance2, map_data):
     for (area, kf_id) in instance2.top_kf:
         instance1.add_top_kf(kf_id, area)
     
-    # Preserve semantic_class_idx: prefer valid class over unassigned
-    if hasattr(instance1, 'semantic_class_idx') and hasattr(instance2, 'semantic_class_idx'):
-        if instance1.semantic_class_idx < 0 and instance2.semantic_class_idx >= 0:
-            # instance1 has no class, instance2 does -> take instance2's class
+    # Merge semantic_class_votes from both instances
+    if hasattr(instance1, 'semantic_class_votes') and hasattr(instance2, 'semantic_class_votes'):
+        for class_idx, vote_count in instance2.semantic_class_votes.items():
+            instance1.semantic_class_votes[class_idx] += vote_count
+        # Recompute majority class after merging votes
+        if instance1.semantic_class_votes:
+            instance1.semantic_class_idx = max(instance1.semantic_class_votes.items(), key=lambda x: x[1])[0]
+    elif hasattr(instance2, 'semantic_class_idx') and instance2.semantic_class_idx >= 0:
+        # Fallback: if instance1 has no votes but instance2 has a class
+        if not hasattr(instance1, 'semantic_class_idx') or instance1.semantic_class_idx < 0:
             instance1.semantic_class_idx = instance2.semantic_class_idx
-        # If both have valid classes, keep instance1's (larger object typically)
-        # If neither has valid class, stays -1
     
     points_ins_ids[points_ins_ids == instance2.id] = instance1.id
     return instance1, points_ins_ids

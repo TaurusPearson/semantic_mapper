@@ -13,6 +13,85 @@ import time
 import os
 
 # =========================================================
+# 0. CLASS SPLITS
+# =========================================================
+
+# --- Replica 51-class taxonomy ---
+# Head: structural elements + large furniture
+# Common: mid-sized objects + household furniture
+# Tail: small, rare, or infrastructure items
+
+REPLICA_CLASS_SPLITS = {
+    "head": [
+        "wall", "ceiling", "floor", "chair", "blinds", "sofa", "table",
+        "rug", "window", "lamp", "door", "pillow", "bench", "tv-screen",
+        "cabinet", "pillar", "blanket",
+    ],
+    "common": [
+        "tv-stand", "cushion", "bin", "vent", "bed", "stool", "picture",
+        "indoor-plant", "desk", "comforter", "nightstand", "shelf", "vase",
+        "plant-stand", "basket", "plate", "monitor",
+    ],
+    "tail": [
+        "pipe", "panel", "desk-organizer", "wall-plug", "book", "box",
+        "clock", "sculpture", "tissue-paper", "camera", "tablet", "pot",
+        "bottle", "candle", "bowl", "cloth", "switch",
+    ],
+}
+
+# --- ScanNet200 200-class taxonomy (official benchmark splits) ---
+
+SCANNET200_CLASS_SPLITS = {
+    "head": [
+        "tv stand", "curtain", "blinds", "shower curtain", "bookshelf", "tv",
+        "kitchen cabinet", "pillow", "lamp", "dresser", "monitor", "object",
+        "ceiling", "board", "stove", "closet wall", "couch", "office chair",
+        "kitchen counter", "shower", "closet", "doorframe", "sofa chair",
+        "mailbox", "nightstand", "washing machine", "picture", "book", "sink",
+        "recycling bin", "table", "backpack", "shower wall", "toilet", "copier",
+        "counter", "stool", "refrigerator", "window", "file cabinet", "chair",
+        "wall", "plant", "coffee table", "stairs", "armchair", "cabinet",
+        "bathroom vanity", "bathroom stall", "mirror", "blackboard", "trash can",
+        "stair rail", "box", "towel", "door", "clothes", "whiteboard", "bed",
+        "floor", "bathtub", "desk", "wardrobe", "clothes dryer", "radiator",
+        "shelf",
+    ],
+    "common": [
+        "cushion", "end table", "dining table", "keyboard", "bag",
+        "toilet paper", "printer", "blanket", "microwave", "shoe",
+        "computer tower", "bottle", "bin", "ottoman", "bench", "basket",
+        "fan", "laptop", "person", "paper towel dispenser", "oven", "rack",
+        "piano", "suitcase", "rail", "container", "telephone", "stand",
+        "light", "laundry basket", "pipe", "seat", "column", "bicycle",
+        "ladder", "jacket", "storage bin", "coffee maker", "dishwasher",
+        "machine", "mat", "windowsill", "bulletin board", "fireplace",
+        "mini fridge", "water cooler", "shower door", "pillar", "ledge",
+        "furniture", "cart", "decoration", "closet door", "vacuum cleaner",
+        "dish rack", "range hood", "projector screen", "divider",
+        "bathroom counter", "laundry hamper", "bathroom stall door",
+        "ceiling light", "trash bin", "bathroom cabinet", "structure",
+        "storage organizer", "potted plant", "mattress",
+    ],
+    "tail": [
+        "paper", "plate", "soap dispenser", "bucket", "clock", "guitar",
+        "toilet paper holder", "speaker", "cup", "paper towel roll", "bar",
+        "toaster", "ironing board", "soap dish", "toilet paper dispenser",
+        "fire extinguisher", "ball", "hat", "shower curtain rod",
+        "paper cutter", "tray", "toaster oven", "mouse",
+        "toilet seat cover dispenser", "storage container", "scale",
+        "tissue box", "light switch", "crate", "power outlet", "sign",
+        "projector", "candle", "plunger", "stuffed animal", "headphones",
+        "broom", "guitar case", "dustpan", "hair dryer", "water bottle",
+        "handicap bar", "purse", "vent", "shower floor", "water pitcher",
+        "bowl", "paper bag", "alarm clock", "music stand",
+        "laundry detergent", "dumbbell", "tube", "cd case", "closet rod",
+        "coffee kettle", "shower head", "keyboard piano",
+        "case of water bottles", "coat rack", "folded chair", "fire alarm",
+        "power strip", "calendar", "poster", "luggage",
+    ],
+}
+
+# =========================================================
 # 1. GEOMETRIC MATCHING
 # =========================================================
 
@@ -181,6 +260,7 @@ def eval_semantics(output_path: str, gt_path: str, scenes: List[str], dataset_in
     if verbose and isinstance(output_path, Path):
         plot_metrics(iou_values, acc_values, labels, output_path, ignore)
         plot_confmat(confusion, labels, output_path)
+        eval_class_splits(confusion, labels, output_path, ignore)
         
     if return_metrics:
         return metrics, confusion
@@ -319,18 +399,37 @@ def plot_confmat(confmat: np.ndarray, labels: List, output_path: Path, save: boo
     confmat_norm = np.nan_to_num(confmat_norm)
 
     n = len(labels)
-    # Scale figure size based on number of classes
-    fig_size = max(10, n * 0.5) 
+
+    # For large class counts (e.g. ScanNet200), filter to active classes only
+    if n > 60:
+        row_sums = confmat.sum(axis=1)
+        col_sums = confmat.sum(axis=0)
+        active = np.where((row_sums > 0) | (col_sums > 0))[0]
+        if len(active) == 0:
+            print(f"[Warn] Confusion matrix is empty, skipping plot.")
+            return
+        active_labels = [labels[i] for i in active]
+        confmat_norm = confmat_norm[np.ix_(active, active)]
+        n_display = len(active)
+        title_suffix = f" ({n_display}/{n} active classes)"
+    else:
+        active_labels = labels
+        n_display = n
+        title_suffix = ""
+
+    # Scale figure size based on number of classes, capped for sanity
+    fig_size = min(40, max(10, n_display * 0.5))
+    dpi = 150 if n_display > 50 else 300
     fig, axs = plt.subplots(figsize=(fig_size, fig_size * 0.8))
     
-    axs.set_title(f"Normalized Confusion Matrix")     
-    df_cm = pd.DataFrame(confmat_norm, index = labels, columns = labels)
+    axs.set_title(f"Normalized Confusion Matrix{title_suffix}")     
+    df_cm = pd.DataFrame(confmat_norm, index=active_labels, columns=active_labels)
     
     sn.heatmap(df_cm, annot=False, ax=axs, xticklabels=True, yticklabels=True, 
-               fmt=".2f", cmap="Blues", square=True)
+               fmt=".2f", cmap="Blues", square=(n_display <= 60))
     
     # Adjust font size based on density
-    font_size = 8 if n > 20 else 12
+    font_size = 5 if n_display > 80 else (8 if n_display > 20 else 12)
     sn.set(font_scale=1.0)
     axs.tick_params(axis='both', which='major', labelsize=font_size)
     plt.xticks(rotation=90)
@@ -338,11 +437,314 @@ def plot_confmat(confmat: np.ndarray, labels: List, output_path: Path, save: boo
     
     plt.tight_layout()
     if save:
-        plt.savefig(output_path / "confmat.png", dpi=300)
+        plt.savefig(output_path / "confmat.png", dpi=dpi)
         print(f"[IO] Confusion Matrix saved to {output_path / 'confmat.png'}")
     else:
         plt.show()
     plt.close()
+
+def plot_confmat_tail(confmat: np.ndarray, labels: List, iou_values: np.ndarray,
+                      output_path: Path, ignore: List[int] = [],
+                      iou_threshold: float = 0.05, top_k_confusions: int = 8) -> None:
+    """Generate focused confusion matrix and text report for tail classes (low IoU)."""
+    num_classes = len(labels)
+
+    # Map full class index → iou_values index (iou_values skips ignored classes)
+    iou_idx = 0
+    class_iou = {}
+    for i in range(num_classes):
+        if i not in ignore:
+            class_iou[i] = iou_values[iou_idx] if iou_idx < len(iou_values) else float('nan')
+            iou_idx += 1
+
+    # Identify tail classes: IoU < threshold and not ignored
+    tail_indices = [i for i, iou in class_iou.items()
+                    if not np.isnan(iou) and iou < iou_threshold]
+
+    if not tail_indices:
+        print(f"[Eval] No tail classes found with IoU < {iou_threshold:.0%}")
+        return
+
+    tail_labels = [labels[i] for i in tail_indices]
+
+    # Normalize confusion matrix rows (GT → Pred distribution)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        confmat_norm = confmat.astype('float') / confmat.sum(axis=1)[:, np.newaxis]
+    confmat_norm = np.nan_to_num(confmat_norm)
+
+    # Collect all columns that any tail class gets confused with (>1%)
+    all_confused_indices = set(tail_indices)
+    for ti in tail_indices:
+        row = confmat_norm[ti]
+        top_preds = np.argsort(row)[::-1][:top_k_confusions]
+        for pi in top_preds:
+            if row[pi] > 0.01:
+                all_confused_indices.add(int(pi))
+
+    display_cols = sorted(all_confused_indices)
+    display_col_labels = [labels[i] for i in display_cols]
+
+    # Extract sub-matrix: tail rows × relevant columns
+    sub_matrix = confmat_norm[np.ix_(tail_indices, display_cols)]
+
+    # --- Heatmap ---
+    fig_h = max(4, len(tail_indices) * 0.6)
+    fig_w = max(8, len(display_cols) * 0.6)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    df = pd.DataFrame(sub_matrix, index=tail_labels, columns=display_col_labels)
+    sn.heatmap(df, annot=True, fmt=".2f", cmap="OrRd", ax=ax,
+               xticklabels=True, yticklabels=True, square=False,
+               linewidths=0.5, linecolor='gray',
+               cbar_kws={'label': 'Fraction of GT points'})
+
+    ax.set_title(f"Tail Class Confusion (IoU < {iou_threshold:.0%})", fontsize=14)
+    ax.set_ylabel("Ground Truth (tail classes)")
+    ax.set_xlabel("Predicted As")
+
+    font_size = 9 if len(display_cols) > 15 else 11
+    ax.tick_params(axis='both', which='major', labelsize=font_size)
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+
+    plt.tight_layout()
+    plt.savefig(output_path / "confmat_tail.png", dpi=200)
+    plt.close()
+    print(f"[IO] Tail confusion matrix saved to {output_path / 'confmat_tail.png'}")
+
+    # --- Text Report ---
+    report_path = output_path / "confmat_tail.txt"
+    with open(report_path, "w") as f:
+        f.write(f"TAIL CLASS CONFUSION REPORT (IoU < {iou_threshold:.0%})\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"Tail classes identified: {len(tail_indices)}\n\n")
+
+        for ti in tail_indices:
+            name = labels[ti]
+            iou = class_iou[ti]
+            row_sum = confmat[ti].sum()
+
+            f.write(f"--- {name} (IoU: {iou:.2%}, GT points: {int(row_sum):,}) ---\n")
+
+            if row_sum == 0:
+                f.write(f"  NO GT POINTS in evaluation (class absent or fully unmapped)\n\n")
+                continue
+
+            # Where do GT points end up? (row distribution)
+            row = confmat_norm[ti]
+            sorted_preds = np.argsort(row)[::-1]
+
+            f.write(f"  Predicted as:\n")
+            for pi in sorted_preds:
+                if row[pi] < 0.005:
+                    break
+                pred_name = labels[pi]
+                n_points = int(confmat[ti, pi])
+                marker = " <-- CORRECT" if pi == ti else ""
+                f.write(f"    {pred_name:20s}: {row[pi]:6.1%} ({n_points:>10,} pts){marker}\n")
+
+            # Reverse: what GT classes get wrongly predicted AS this tail class?
+            col = confmat_norm[:, ti]
+            sources = [(si, col[si]) for si in np.argsort(col)[::-1]
+                       if col[si] > 0.01 and si != ti]
+
+            if sources:
+                f.write(f"  Other classes wrongly predicted as '{name}':\n")
+                for si, frac in sources[:5]:
+                    f.write(f"    {labels[si]:20s}: {frac:6.1%} ({int(confmat[si, ti]):>10,} pts)\n")
+
+            f.write("\n")
+
+    print(f"[IO] Tail confusion report saved to {report_path}")
+
+def eval_class_splits(confmat: np.ndarray, labels: List, output_path: Path,
+                      ignore: List[int] = [],
+                      splits: Dict[str, List[str]] = None) -> Dict[str, Dict]:
+    """
+    Compute per-split metrics and generate per-split confusion matrices.
+    
+    IoU/Acc are computed from the FULL confusion matrix (cross-split FP/FN counted),
+    then averaged only over classes in each split.
+    Splits are defined by class name strings, resolved to indices at runtime.
+    """
+    if splits is None:
+        # Auto-detect: pick whichever split dict matches more class names
+        name_set = set(labels)
+        replica_hits = sum(1 for names in REPLICA_CLASS_SPLITS.values() for n in names if n in name_set)
+        scannet_hits = sum(1 for names in SCANNET200_CLASS_SPLITS.values() for n in names if n in name_set)
+        if scannet_hits > replica_hits:
+            splits = SCANNET200_CLASS_SPLITS
+            print(f"[Eval] Auto-detected ScanNet200 class splits ({scannet_hits} matches)")
+        else:
+            splits = REPLICA_CLASS_SPLITS
+            print(f"[Eval] Auto-detected Replica class splits ({replica_hits} matches)")
+
+    # Build name -> index lookup
+    name_to_idx = {name: i for i, name in enumerate(labels)}
+
+    # Early exit if no split names match the labels
+    total_matched = sum(1 for names in splits.values() for n in names if n in name_to_idx)
+    if total_matched == 0:
+        print(f"[Eval] Skipping class split evaluation — no split names match the {len(labels)} class labels.")
+        return {}
+
+    # Compute per-class IoU and Acc from FULL confusion matrix
+    all_iou = {}
+    all_acc = {}
+    all_weight = {}
+    for i in range(len(labels)):
+        if i not in ignore:
+            iou, acc = get_iou(i, confmat)
+            all_iou[i] = iou
+            all_acc[i] = acc
+            all_weight[i] = float(confmat[i].sum())
+
+    # Normalize full confusion matrix for heatmaps
+    with np.errstate(divide='ignore', invalid='ignore'):
+        confmat_norm = confmat.astype('float') / confmat.sum(axis=1)[:, np.newaxis]
+    confmat_norm = np.nan_to_num(confmat_norm)
+
+    split_metrics = {}
+    report_lines = []
+    report_lines.append("CLASS SPLIT EVALUATION REPORT")
+    report_lines.append("=" * 70)
+
+    for split_name, split_names in splits.items():
+        # Resolve class names to indices
+        split_indices = [name_to_idx[n] for n in split_names if n in name_to_idx]
+        # Filter to non-ignored classes in this split
+        valid_indices = [i for i in split_indices if i not in ignore and i in all_iou]
+
+        if not valid_indices:
+            report_lines.append(f"\n--- {split_name.upper()} ({len(split_indices)} classes) ---")
+            report_lines.append("  No valid classes in this split.")
+            continue
+
+        # Per-class IoU/Acc for this split
+        split_iou = np.array([all_iou[i] for i in valid_indices])
+        split_acc = np.array([all_acc[i] for i in valid_indices])
+        split_wt = np.array([all_weight[i] for i in valid_indices])
+        split_labels = [labels[i] for i in valid_indices]
+
+        # Mask NaN (classes with 0 GT points)
+        iou_valid = ~np.isnan(split_iou)
+        acc_valid = ~np.isnan(split_acc)
+
+        m_iou = float(np.mean(split_iou[iou_valid])) if iou_valid.any() else 0.0
+        m_acc = float(np.mean(split_acc[acc_valid])) if acc_valid.any() else 0.0
+
+        wt_sum = split_wt[iou_valid].sum()
+        f_iou = float(np.sum(split_iou[iou_valid] * split_wt[iou_valid]) / wt_sum) if wt_sum > 0 else 0.0
+        wt_sum_a = split_wt[acc_valid].sum()
+        f_acc = float(np.sum(split_acc[acc_valid] * split_wt[acc_valid]) / wt_sum_a) if wt_sum_a > 0 else 0.0
+
+        n_zero = int(np.sum(split_iou[iou_valid] == 0))
+
+        split_metrics[split_name] = {
+            "mIoU": round(m_iou, 4),
+            "mAcc": round(m_acc, 4),
+            "f-mIoU": round(f_iou, 4),
+            "f-mAcc": round(f_acc, 4),
+            "n_classes": len(valid_indices),
+            "n_zero_iou": n_zero,
+        }
+
+        # --- Text Report ---
+        report_lines.append(f"\n--- {split_name.upper()} ({len(valid_indices)} classes, {n_zero} at 0% IoU) ---")
+        report_lines.append(f"  mIoU: {m_iou:.2%}    mAcc: {m_acc:.2%}")
+        report_lines.append(f"  f-mIoU: {f_iou:.2%}  f-mAcc: {f_acc:.2%}")
+        report_lines.append(f"  {'Class':<20s}  {'IoU':>7s}  {'Acc':>7s}  {'GT pts':>12s}")
+        report_lines.append(f"  {'-'*50}")
+
+        for idx, ci in enumerate(valid_indices):
+            iou_str = f"{split_iou[idx]:.2%}" if not np.isnan(split_iou[idx]) else "  NaN"
+            acc_str = f"{split_acc[idx]:.2%}" if not np.isnan(split_acc[idx]) else "  NaN"
+            report_lines.append(f"  {split_labels[idx]:<20s}  {iou_str:>7s}  {acc_str:>7s}  {int(split_wt[idx]):>12,}")
+
+        # --- Per-split Confusion Matrix Heatmap ---
+        # Per-scene filtering: only show classes that have GT points in this scene
+        active_indices = [i for i in valid_indices if confmat[i].sum() > 0]
+        active_names = [labels[i] for i in active_indices]
+        
+        if not active_indices:
+            print(f"[Eval] No GT classes in {split_name} split for this scene (0/{len(valid_indices)} present), skipping heatmap.")
+            continue
+        
+        print(f"[Eval] {split_name.upper()}: {len(active_indices)}/{len(valid_indices)} classes with GT: {active_names[:5]}{'...' if len(active_names) > 5 else ''}")
+        
+        # Row labels = only active classes (per-scene filtering)
+        row_labels = [labels[i] for i in active_indices]
+
+        # Columns: active split classes + top confused-with classes
+        all_col_indices = set(active_indices)
+        for ci in active_indices:
+            row = confmat_norm[ci]
+            top_preds = np.argsort(row)[::-1][:10]
+            for pi in top_preds:
+                if row[pi] > 0.01:
+                    all_col_indices.add(int(pi))
+
+        display_cols = sorted(all_col_indices)
+        display_col_labels = [labels[i] for i in display_cols]
+
+        sub_matrix = confmat_norm[np.ix_(active_indices, display_cols)]
+
+        n_rows = len(active_indices)
+        n_cols = len(display_cols)
+        fig_h = min(35, max(5, n_rows * 0.55))
+        fig_w = min(40, max(8, n_cols * 0.55))
+        split_dpi = 150 if n_cols > 60 else 200
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        cmap = {"head": "Blues", "common": "Greens", "tail": "OrRd"}.get(split_name, "Blues")
+        df = pd.DataFrame(sub_matrix, index=row_labels, columns=display_col_labels)
+
+        # Determine max value for color scaling
+        vmax_val = float(sub_matrix.max()) if sub_matrix.max() > 0 else 1.0
+        
+        annot = n_cols <= 25
+        sn.heatmap(df, annot=annot, fmt=".2f" if annot else "", cmap=cmap, ax=ax,
+                   xticklabels=True, yticklabels=True, square=False,
+                   vmin=0, vmax=max(0.01, vmax_val),
+                   linewidths=0.3 if n_cols <= 60 else 0,
+                   linecolor='gray',
+                   cbar_kws={'label': 'Fraction of GT points'})
+
+        # Title shows per-scene active count vs total split size
+        n_total_split = len(valid_indices)
+        title_note = f" — {n_rows}/{n_total_split} present in scene"
+        ax.set_title(f"{split_name.upper()} Class Confusion{title_note}", fontsize=14)
+        ax.set_ylabel("Ground Truth")
+        ax.set_xlabel("Predicted As")
+
+        font_size = 5 if n_cols > 80 else (7 if n_cols > 40 else (8 if n_cols > 20 else 10))
+        ax.tick_params(axis='both', which='major', labelsize=font_size)
+        plt.xticks(rotation=90, ha='right')
+        plt.yticks(rotation=0)
+
+        plt.tight_layout()
+        fname = f"confmat_{split_name}.png"
+        plt.savefig(output_path / fname, dpi=split_dpi)
+        plt.close()
+        print(f"[IO] {split_name.upper()} confusion matrix saved to {output_path / fname}")
+
+    # --- Summary comparison ---
+    report_lines.append(f"\n{'='*70}")
+    report_lines.append(f"{'Split':<10s}  {'mIoU':>8s}  {'mAcc':>8s}  {'f-mIoU':>8s}  {'f-mAcc':>8s}  {'#cls':>5s}  {'#0%':>4s}")
+    report_lines.append(f"{'-'*55}")
+    for sname, sm in split_metrics.items():
+        report_lines.append(
+            f"{sname:<10s}  {sm['mIoU']:>7.2%}  {sm['mAcc']:>7.2%}  "
+            f"{sm['f-mIoU']:>7.2%}  {sm['f-mAcc']:>7.2%}  {sm['n_classes']:>5d}  {sm['n_zero_iou']:>4d}"
+        )
+
+    # Write combined report
+    report_path = output_path / "class_splits_report.txt"
+    with open(report_path, "w") as f:
+        f.write("\n".join(report_lines))
+    print(f"[IO] Class splits report saved to {report_path}")
+
+    return split_metrics
 
 # =========================================================
 # 5. PERFORMANCE MONITOR

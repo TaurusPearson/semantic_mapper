@@ -3299,7 +3299,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
     # 6. Pipeline Config
     pipeline_config = {
         "sem_name": sem_cfg['name'],
-        "max_frames": 4000,
+        "max_frames": 5000,
         "mapping": { 
             "map_every": 10, 
             "downscale_ratio": 3,
@@ -3327,7 +3327,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "enabled": True,
             "min_votes": 3,                # Require more votes for stable K-pool
             "min_keyframes": 5,            # Filter noisy single-frame objects
-            "min_siglip_conf": 0.5,       # SigLIP must be this confident to override
+            "min_siglip_conf": 0.5,        # SigLIP must be this confident to override
             "temperature": 0.1,            # Softmax temperature for K-pool
             "synonym_threshold": 0.86,     # Text-embed cosine sim to detect near-synonyms
         },
@@ -3367,7 +3367,7 @@ def main():
     
     # 0. Dataset Selection
     # Options: 'replica' | 'scannet20' | 'scannet200'
-    CURRENT_DATASET = 'replica'
+    CURRENT_DATASET = 'scannet200'
     
     # 1. Prompt Mode
     # Options: 'ensemble' (OpenAI Standard) | 'handcrafted' (Your Custom Dict) | 'llm' (LLM-generated)
@@ -3401,8 +3401,8 @@ def main():
         eval_config_path = os.path.join(script_dir, "eval_info.yaml")
         cam_config_path = os.path.join(script_dir, "replica.yaml")
         SCENES = ["office1", "office4"]  # Default Replica scenes
-        SCENES = ["office0", "office2", "office3", "room0", "room1", "room2"]
-        SCENES = ["office1"]
+        SCENES = ["office0", "office1", "office2", "office3", "office4", "room0", "room1", "room2"]
+        # SCENES = ["office0", "office1", "office2", "office3", "office4"]
     elif CURRENT_DATASET == "scannet20":
         eval_config_path = os.path.join(script_dir, "scannet20.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
@@ -3411,6 +3411,7 @@ def main():
         eval_config_path = os.path.join(script_dir, "scannet200.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
         SCENES = ["scene0011_00", "scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
+        SCENES = ["scene0011_00"]
     else:
         print(f"[Error] Unknown dataset: {CURRENT_DATASET}")
         return
