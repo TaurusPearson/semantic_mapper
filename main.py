@@ -766,19 +766,21 @@ class ScanNet(BaseDataset):
                 self.map_to_reduced = {}  # No mapping - use raw labels
                 self.ignore_ids = []  # No ignored classes for raw label evaluation
                 
-                # Use RAW labels from aggregation.json directly
+                # HYBRID: SAM3 queries per-scene classes, SigLIP validates against 200
+                all_class_names = full_config.get("class_names_reduced", [])
+                self.full_class_names = all_class_names  # Store full 200 for SigLIP
+                
+                # Load per-scene raw classes for SAM3 prompts
                 scene_classes = self._load_scene_classes()
                 if scene_classes:
-                    # Use raw labels AS-IS, no filtering
-                    self.class_names = scene_classes
-                    self.full_class_names = scene_classes
-                    print(f"[ScanNet] Using RAW per-scene classes: {self.class_names}", flush=True)
+                    self.class_names = scene_classes  # SAM3 queries per-scene
+                    self.scene_classes = scene_classes
+                    print(f"[ScanNet] HYBRID: SAM3 queries {len(scene_classes)} per-scene classes", flush=True)
+                    print(f"[ScanNet] SigLIP will validate against {len(all_class_names)} classes", flush=True)
                 else:
-                    # Fallback to full taxonomy if aggregation.json not found
-                    all_class_names = full_config.get("class_names_reduced", [])
                     self.class_names = all_class_names
-                    self.full_class_names = all_class_names
-                    print(f"[ScanNet] Fallback to full taxonomy: {len(self.class_names)} classes", flush=True)
+                    self.scene_classes = all_class_names
+                    print(f"[ScanNet] Fallback to full {len(all_class_names)}-class taxonomy", flush=True)
             else:
                 # Look for scannet section in config
                 if "scannet" in full_config:
@@ -916,7 +918,11 @@ class SemanticClassifier:
                 emb_list = []
                 for label in label_list:
                     if label in bank:
-                        emb_list.append(bank[label].to(self.device))
+                        emb = bank[label].to(self.device)
+                        # Ensure 1D: squeeze any extra dimensions
+                        if emb.dim() > 1:
+                            emb = emb.squeeze()
+                        emb_list.append(emb)
                     else:
                         print(f"{Log.RED}[Error] Class '{label}' missing from text bank!{Log.END}")
                         
@@ -2088,7 +2094,7 @@ class ReplicaFusionPipeline:
                 print(f"[GT] Loaded Replica ID mapping: {len(map_to_reduced)} entries")
         
         return map_to_reduced
-
+    
     def run(self, mask_generator, classifier, detailed_logging_enabled):
         print(f"--- Starting Fusion Pipeline for {self.scene_name} ---", flush=True)
         
@@ -2137,11 +2143,12 @@ class ReplicaFusionPipeline:
             else:
                 rgb_depth_ratio = []
 
+
             # B. GET MASKS
             self.monitor.start_component("semantics")
             binary_maps = torch.tensor([], device=self.device)
-            seg_map_np = np.array([]) 
-            
+            seg_map_np = np.array([])
+
             if frame_id % segment_every == 0:
                 print(f"[Frame {frame_id}] Starting mask generation...", flush=True)
                 seg_maps_t, binary_maps_t = mask_generator.get_masks(rgb, frame_id)
@@ -2349,22 +2356,53 @@ class ReplicaFusionPipeline:
         pcd_pred, _, pcd_ins_ids = self.mapper.get_map()
         
         # 2. Load Evaluation Config
-        # For ScanNet: Use RAW labels from aggregation.json (per-scene open-vocabulary)
-        # For Replica: Use eval_info.yaml class_names_reduced
+        # ACADEMIC-COMPARABLE: Use full 200-class taxonomy for ScanNet evaluation
         eval_config = {}
+        use_full_taxonomy_eval = False
+        scene_to_full_map = {}  # Maps per-scene index -> 200-class index
         
         if isinstance(self.loader, ScanNet):
-            # ScanNet: Use RAW per-scene labels for true open-vocabulary evaluation
-            reduced_names = self.loader.class_names  # Raw labels from aggregation.json
-            print(f"[Eval] Using RAW per-scene labels: {reduced_names}")
-            
-            # No mapping needed - predictions and GT both use raw label indices
-            eval_config = {
-                "class_names_reduced": reduced_names,
-                "num_classes": len(reduced_names),
-                "ignore": [-1],
-                "map_to_reduced": None  # No mapping for raw labels
-            }
+            # Load full 200-class taxonomy from scannet200.yaml
+            script_dir = Path(__file__).parent
+            scannet200_config = script_dir / "scannet200.yaml"
+            if scannet200_config.exists():
+                with open(scannet200_config, 'r') as f:
+                    full_config = yaml.safe_load(f)
+                reduced_names = full_config.get("class_names_reduced", [])
+                map_to_reduced = full_config.get("map_to_reduced", {})
+                
+                # Build mapping: per-scene class name -> 200-class index
+                per_scene_names = self.loader.class_names
+                for i, name in enumerate(per_scene_names):
+                    if name in reduced_names:
+                        scene_to_full_map[i] = reduced_names.index(name)
+                    else:
+                        # Try variants
+                        for variant in [name.rstrip('s'), name.replace(' cabinets', ' cabinet')]:
+                            if variant in reduced_names:
+                                scene_to_full_map[i] = reduced_names.index(variant)
+                                break
+                
+                print(f"[Eval] ACADEMIC MODE: Using full {len(reduced_names)}-class taxonomy")
+                print(f"[Eval] Mapped {len(scene_to_full_map)}/{len(per_scene_names)} per-scene classes to 200-class indices")
+                use_full_taxonomy_eval = True
+                
+                eval_config = {
+                    "class_names_reduced": reduced_names,
+                    "num_classes": len(reduced_names),
+                    "ignore": [-1],
+                    "map_to_reduced": map_to_reduced
+                }
+            else:
+                # Fallback to per-scene
+                reduced_names = self.loader.class_names
+                print(f"[Eval] Using per-scene labels (no scannet200.yaml): {reduced_names}")
+                eval_config = {
+                    "class_names_reduced": reduced_names,
+                    "num_classes": len(reduced_names),
+                    "ignore": [-1],
+                    "map_to_reduced": None
+                }
         else:
             # Fallback to eval_info.yaml (Replica)
             eval_config_path = "eval_info.yaml"
@@ -2506,40 +2544,34 @@ class ReplicaFusionPipeline:
         )
 
         # 6. Generate Final Labels
-        # lookup_table maps Instance ID -> Reduced Class ID directly now
         max_ins_id = lookup_table.shape[0]
-        # Handle instances that might be out of bounds (though unlikely with tight loop)
         safe_indices = mesh_instance_ids.numpy().astype(int)
         safe_indices[safe_indices >= max_ins_id] = -1
         pred_labels_np = np.full(safe_indices.shape, -1, dtype=np.int64)
         valid_mask = safe_indices >= 0
         pred_labels_np[valid_mask] = lookup_table[safe_indices[valid_mask]]
 
-        # 7. Save & Eval
+        # 7. Save predictions
         os.makedirs(self.output_dir, exist_ok=True)
         pred_txt_path = os.path.join(self.output_dir, f"{self.scene_name}.txt")
         np.savetxt(pred_txt_path, pred_labels_np, fmt="%d")
 
-        # Find GT labels file
-        # Priority: raw_gt (per-scene raw labels) > scannet200_gt > semantic_gt > Replica fallback
-        scannet_root = self.loader.dataset_path.parent.parent  # scannet_data/
+        # 8. Find GT labels file
+        scannet_root = self.loader.dataset_path.parent.parent
         gt_txt_path = None
 
-        # 1. RAW GT: per-scene raw labels from aggregation.json (for open-vocabulary eval)
-        if isinstance(self.loader, ScanNet):
-            raw_gt = scannet_root / "raw_gt" / f"{self.scene_name}.txt"
-            if raw_gt.exists():
-                gt_txt_path = raw_gt
-                print(f"[Eval] Using RAW GT (open-vocabulary): {gt_txt_path}")
-
-        # 2. ScanNet200: pre-generated fine-grained GT labels (needs map_to_reduced)
-        if gt_txt_path is None:
+        if isinstance(self.loader, ScanNet) and use_full_taxonomy_eval:
             scannet200_gt = scannet_root / "scannet200_gt" / f"{self.scene_name}.txt"
             if scannet200_gt.exists():
                 gt_txt_path = scannet200_gt
-                print(f"[Eval] Using ScanNet200 GT: {gt_txt_path}")
+                print(f"[Eval] ACADEMIC: Using ScanNet200 GT: {gt_txt_path}")
+        
+        if gt_txt_path is None and isinstance(self.loader, ScanNet):
+            raw_gt = scannet_root / "raw_gt" / f"{self.scene_name}.txt"
+            if raw_gt.exists():
+                gt_txt_path = raw_gt
+                print(f"[Eval] Using RAW GT: {gt_txt_path}")
 
-        # 3. semantic_gt (ScanNet20 / Replica)
         if gt_txt_path is None:
             for candidate in [
                 self.loader.dataset_path.parent / "semantic_gt" / f"{self.scene_name}.txt",
@@ -2550,16 +2582,15 @@ class ReplicaFusionPipeline:
                     print(f"[Eval] Using semantic GT: {gt_txt_path}")
                     break
 
-        # 4. Replica fallback: scene directory
         if gt_txt_path is None:
             replica_gt = self.loader.dataset_path / f"{self.scene_name}.txt"
             if replica_gt.exists():
                 gt_txt_path = replica_gt
                 print(f"[Eval] Using Replica GT: {gt_txt_path}")
 
+        # 9. Evaluate
         if gt_txt_path is not None and gt_txt_path.exists():
             print(f"[Eval] Comparing against GT: {gt_txt_path}")
-
             dataset_info = eval_config.copy() if eval_config else {}
             dataset_info["num_classes"] = len(reduced_names)
             dataset_info["class_names"] = reduced_names
@@ -2572,13 +2603,11 @@ class ReplicaFusionPipeline:
                 verbose=True
             )
             
-            # Print metrics to console
             print(f"\n{Log.GREEN}[Eval] Scene: {self.scene_name} | mIoU: {miou:.2f}%{Log.END}\n")
-            
             return {"scene": self.scene_name, "miou": miou}
         
         return 0.0
-    
+
     def _generate_gt_txt(self, mesh_path, out_path):
         from plyfile import PlyData
         plydata = PlyData.read(mesh_path)
@@ -2590,7 +2619,7 @@ class ReplicaFusionPipeline:
                 break
         if labels is not None:
             np.savetxt(out_path, labels, fmt="%d")
-    
+
     def _log_object_birth(self, classifier):
         """
         Checks for objects that have features but haven't been logged yet.
@@ -2607,30 +2636,20 @@ class ReplicaFusionPipeline:
                 area = obj.birth_stats["mask_area"]
                 
                 # 2. Get Semantic Stats
-                # We manually run the similarity logic to capture intermediate values
                 with torch.no_grad():
-                    # Normalize image feature
                     img_feat = obj.clip_feature.to(self.device).float()
                     img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                    
-                    # Get Raw Similarity (Dot Product)
-                    # Shape: [1, N_Classes]
                     raw_sim = classifier._similarity_logits(img_feat).squeeze()
                     
-                    # Get Temperature/Bias (Specific to SigLIP/CLIP)
                     temp_str = "N/A"
                     if classifier.siglip and classifier.temperature is not None:
                         t = classifier.temperature.item() if isinstance(classifier.temperature, torch.Tensor) else classifier.temperature
                         b = classifier.bias.item() if classifier.bias is not None else 0.0
                         temp_str = f"Temp={t:.4f}, Bias={b:.4f}"
                     
-                    # Get Probabilities
                     probs = torch.nn.functional.softmax(raw_sim, dim=0)
-                    
-                    # Get Top 3 Predictions
                     top_vals, top_idxs = torch.topk(probs, 3)
                 
-                # 3. Formulate the Log
                 print(f"\n{Log.GREEN}=== [BIRTH CERTIFICATE] ID {oid} ==={Log.END}")
                 print(f"  {Log.BLUE}Geometry:{Log.END}  Points={pts}, Initial Area={area} px")
                 print(f"  {Log.BLUE}Model Params:{Log.END} {temp_str}")
@@ -2644,8 +2663,6 @@ class ReplicaFusionPipeline:
                     print(f"    {i+1}. {Log.BOLD}{label}{Log.END} \t(Conf: {score:.4f} | Raw Logit: {logit:.4f})")
                 
                 print(f"{Log.GREEN}===================================={Log.END}\n")
-                
-                # Mark as reported so we don't spam
                 obj.reported = True
 
     def _log_vote_distributions(self, class_names: list):
@@ -2880,248 +2897,137 @@ class ReplicaFusionPipeline:
                             f.write(f"    {name}: {votes} votes ({pct:.1f}%){marker}\n")
                     else:
                         f.write(f"  Vote Distribution: (no votes)\n")
-                    f.write("\n")
-                    
             print(f"\n[VoteDiag] Detailed log saved to: {log_path}")
         print(f"{Log.HEADER}======================================{Log.END}\n")
 
-    def _validate_with_siglip_kpool(self, class_names: list) -> dict:
-        """
-        SigLIP K-Pool Validation: Override SAM3's classification using SigLIP
-        against the pool of classes that SAM3 has voted for.
+    def _validate_with_siglip_kpool(self, class_names, validation_config=None):
+        """SigLIP K-Pool Validation for SAM3 predictions."""
+        if validation_config is None:
+            validation_config = self.config.get("siglip_validation", {})
         
-        For each object:
-          1. Get all classes SAM3 voted for (the K-pool)
-          2. Compute SigLIP similarity against ONLY those classes
-          3. Return SigLIP's pick as the validated class
-        
-        Returns:
-            dict: {obj_id: validated_class_idx} for all validated objects
-        """
-        validation_config = self.config.get("siglip_validation", {})
         enabled = validation_config.get("enabled", True)
-        min_votes = validation_config.get("min_votes", 3)
-        min_keyframes = validation_config.get("min_keyframes", 3)  # Filter noisy single-frame objects
-        min_siglip_conf = validation_config.get("min_siglip_conf", 0.50)  # For K-pool mode
-        temperature = validation_config.get("temperature", 0.1)  # For K-pool mode
-        synonym_threshold = validation_config.get("synonym_threshold", 0.85)  # Text-embed cosine sim to detect synonyms
-        
         if not enabled:
-            print(f"[SigLIP-Val] Validation disabled, using SAM3 labels directly")
             return {}
         
+        min_votes = validation_config.get("min_votes", 3)
+        min_keyframes = validation_config.get("min_keyframes", 3)
+        min_siglip_conf = validation_config.get("min_siglip_conf", 0.50)
+        temperature = validation_config.get("temperature", 0.1)
+        
         print(f"\n{Log.HEADER}=== SIGLIP K-POOL VALIDATION ==={Log.END}")
-        print(f"[SigLIP-Val] Min votes: {min_votes}")
-        print(f"[SigLIP-Val] Min SigLIP conf: {min_siglip_conf}")
-        print(f"[SigLIP-Val] Temperature: {temperature}")
-        print(f"[SigLIP-Val] Synonym threshold: {synonym_threshold}")
-        
-        # Debug: Print SigLIP scaling parameters
-        if hasattr(self.semantic_mapper, 'clip_generator'):
-            cg = self.semantic_mapper.clip_generator
-            if cg.siglip and len(cg.similarity_args) == 2:
-                scale, bias = cg.similarity_args
-                print(f"[SigLIP-Val] Scale: {scale.item():.4f} (exp={scale.exp().item():.4f}), Bias: {bias.item():.4f}")
-        
         validated_labels = {}
-        validation_stats = {
-            "total": 0, "validated": 0, "overrides": 0, "agreements": 0,
-            "skipped_no_clip": 0, "skipped_no_votes": 0, "skipped_few_keyframes": 0,
-            "synonym_overrides": 0
-        }
-        validation_log = []
-        
-        # Fix #1: Find "object" class index to block overrides to it
-        object_class_idx = -1
-        for i, name in enumerate(class_names):
-            if name.lower() == "object":
-                object_class_idx = i
-                break
-        if object_class_idx >= 0:
-            print(f"[SigLIP-Val] Blocking overrides TO 'object' (idx={object_class_idx})")
+        stats = {"validated": 0, "overrides": 0}
+        cg = self.semantic_mapper.clip_generator
         
         for obj_id, obj in self.semantic_mapper.objects.items():
-            validation_stats["total"] += 1
-            
             sam3_class = obj.semantic_class_idx
             sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
             total_votes = sum(sam3_votes.values())
             
-            if total_votes < min_votes:
-                validation_stats["skipped_no_votes"] += 1
-                # Fix #3: Don't add to validated_labels — let these fall through to CLIP
+            if total_votes < min_votes or obj.clip_feature is None:
                 continue
-            
-            # Minimum keyframe filter - skip noisy single-frame objects
-            n_keyframes = len(obj.kfs_ids) if hasattr(obj, 'kfs_ids') else 0
-            if n_keyframes < min_keyframes:
-                validation_stats["skipped_few_keyframes"] += 1
-                validated_labels[obj_id] = sam3_class
-                continue
-            
-            if obj.clip_feature is None:
-                validation_stats["skipped_no_clip"] += 1
+            if len(obj.kfs_ids) < min_keyframes:
                 validated_labels[obj_id] = sam3_class
                 continue
             
             sam3_conf = sam3_votes.get(sam3_class, 0) / total_votes if total_votes > 0 else 0.0
-            
-            # K-pool mode: only use classes SAM3 voted for
             candidate_indices = list(sam3_votes.keys())
-            candidate_names = [class_names[i] if 0 <= i < len(class_names) else f"idx_{i}" for i in candidate_indices]
-            
-            if len(candidate_indices) == 0:
+            if not candidate_indices:
                 validated_labels[obj_id] = sam3_class
                 continue
             
             try:
                 img_feat = obj.clip_feature.to(self.device).float()
                 img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-6)
-                
-                # Use RAW COSINE SIMILARITY (not sigmoid-scaled)
-                # This gives interpretable 0-1 range instead of SigLIP's sharp transitions
-                cg = self.semantic_mapper.clip_generator
-                
-                # Compute ensemble text embeddings (mean across 80 templates per class)
-                n_cands = len(candidate_names)
-                txt_embeds = torch.zeros((n_cands, img_feat.shape[-1]), device=self.device)
-                for j, name in enumerate(candidate_names):
-                    # Format with all templates and mean-pool
-                    templated = [t.format(name.replace("-", " ")) for t in IMAGENET_TEMPLATES]
-                    embed = cg.get_txt_embedding(templated).mean(0, keepdim=True).float()
-                    txt_embeds[j] = torch.nn.functional.normalize(embed, p=2, dim=-1)
-                
-                # Raw cosine similarity (no sigmoid scaling)
                 if img_feat.dim() == 1:
                     img_feat = img_feat.unsqueeze(0)
-                similarities = (img_feat @ txt_embeds.T).squeeze()
                 
-                # Handle edge case: single candidate (0-dim tensor after squeeze)
-                if similarities.dim() == 0:
-                    best_local_idx = 0
-                    siglip_conf = 1.0  # Only one candidate = 100% confident
-                    raw_sim = similarities.item()
+                txt_embeds = []
+                for idx in candidate_indices:
+                    name = class_names[idx] if 0 <= idx < len(class_names) else "object"
+                    templated = [t.format(name.replace("-", " ")) for t in IMAGENET_TEMPLATES]
+                    embed = cg.get_txt_embedding(templated).mean(0).float()
+                    txt_embeds.append(torch.nn.functional.normalize(embed, p=2, dim=-1))
+                txt_embeds = torch.stack(txt_embeds)
+                
+                sims = (img_feat @ txt_embeds.T).squeeze()
+                if sims.dim() == 0:
+                    best_idx, siglip_conf = 0, 1.0
                 else:
-                    # Apply softmax temperature scaling for relative confidence
-                    probs = torch.softmax(similarities / temperature, dim=0)
-                    best_local_idx = probs.argmax().item()
-                    siglip_conf = probs[best_local_idx].item()  # Now 0-1 relative confidence
-                    raw_sim = similarities[best_local_idx].item()
+                    probs = torch.softmax(sims / temperature, dim=0)
+                    best_idx = probs.argmax().item()
+                    siglip_conf = probs[best_idx].item()
                 
-                siglip_class = candidate_indices[best_local_idx]
+                siglip_class = candidate_indices[best_idx]
+                should_override = siglip_class != sam3_class and (siglip_conf > 0.6 or (siglip_conf > min_siglip_conf and sam3_conf < 0.8))
                 
-                # Compute text-embedding similarity between SAM3's pick and SigLIP's pick
-                # for synonym detection (no hardcoded alias maps needed)
-                text_sim = 0.0
-                if siglip_class != sam3_class and sam3_class in candidate_indices:
-                    sam3_local_idx = candidate_indices.index(sam3_class)
-                    text_sim = (txt_embeds[sam3_local_idx] @ txt_embeds[best_local_idx]).item()
-                
-            except Exception as e:
-                print(f"[SigLIP-Val] Error validating obj {obj_id}: {e}")
+                validated_labels[obj_id] = siglip_class if should_override else sam3_class
+                stats["validated"] += 1
+                if should_override:
+                    stats["overrides"] += 1
+            except:
                 validated_labels[obj_id] = sam3_class
-                continue
-            
-            # Decide whether to override
-            # Three-tier logic:
-            # 0. Synonym: SAM3 & SigLIP picks are near-synonyms → trust SigLIP (any confidence)
-            # 1. SigLIP > 60% → override regardless of SAM3 (high confidence)
-            # 2. SigLIP > min_siglip_conf AND SAM3 < 80% → override (medium confidence + weak SAM3)
-            should_override = False
-            override_reason = ""
-            
-            if siglip_class != sam3_class:
-                if siglip_class == object_class_idx:
-                    override_reason = "blocked_object_override"
-                elif text_sim >= synonym_threshold:
-                    should_override = True
-                    override_reason = f"synonym_override(sim={text_sim:.3f})"
-                    validation_stats["synonym_overrides"] += 1
-                elif siglip_conf > 0.60:
-                    should_override = True
-                    override_reason = "siglip_confident"
-                elif siglip_conf > min_siglip_conf and sam3_conf < 0.80:
-                    should_override = True
-                    override_reason = "simple_override"
-                elif siglip_conf <= min_siglip_conf:
-                    override_reason = f"siglip_low({siglip_conf:.2f})"
-                else:
-                    override_reason = f"sam3_protected({sam3_conf:.0%})"
-            
-            # Apply decision
-            if should_override:
-                final_class = siglip_class
-                validation_stats["overrides"] += 1
-            else:
-                final_class = sam3_class
-                validation_stats["agreements"] += 1
-            
-            validated_labels[obj_id] = final_class
-            validation_stats["validated"] += 1
-            
-            sam3_name = class_names[sam3_class] if 0 <= sam3_class < len(class_names) else f"idx_{sam3_class}"
-            siglip_name = class_names[siglip_class] if 0 <= siglip_class < len(class_names) else f"idx_{siglip_class}"
-            final_name = class_names[final_class] if 0 <= final_class < len(class_names) else f"idx_{final_class}"
-            # Build K-pool string from SAM3 votes (not full-class indices)
-            kpool_indices = list(sam3_votes.keys())
-            cand_dist = ", ".join([f"{class_names[idx]}:{sam3_votes[idx]}" for idx in kpool_indices[:5]])
-            
-            validation_log.append({
-                "obj_id": obj_id,
-                "n_points": len(obj.points_ids) if hasattr(obj, 'points_ids') else 0,
-                "sam3_class": sam3_name, "sam3_conf": sam3_conf,
-                "siglip_class": siglip_name, "siglip_conf": siglip_conf,
-                "final_class": final_name,
-                "overridden": siglip_class != sam3_class and final_class == siglip_class,
-                "override_reason": override_reason,
-                "text_sim": text_sim,
-                "candidates": cand_dist
-            })
         
-        print(f"\n[SigLIP-Val] Results:")
-        print(f"  Total objects:     {validation_stats['total']}")
-        print(f"  Validated:         {validation_stats['validated']}")
-        print(f"  Overrides:         {validation_stats['overrides']} (synonym: {validation_stats['synonym_overrides']})")
-        print(f"  Agreements:        {validation_stats['agreements']}")
-        print(f"  Skipped (no CLIP): {validation_stats['skipped_no_clip']}")
-        
-        overrides = [e for e in validation_log if e["overridden"]]
-        if overrides:
-            print(f"\n[SigLIP-Val] OVERRIDES ({len(overrides)}):")
-            for e in overrides[:15]:
-                reason = e.get('override_reason', '')
-                sim_str = f" [txt_sim={e['text_sim']:.3f}]" if e.get('text_sim', 0) > 0 else ""
-                print(f"  ID {e['obj_id']:3d}: SAM3={e['sam3_class']:12s} ({e['sam3_conf']:.1%}) -> SigLIP={e['siglip_class']:12s} ({e['siglip_conf']:.2f}) {reason}{sim_str}")
-        
-        if hasattr(self, 'output_dir') and self.output_dir:
-            log_path = os.path.join(self.output_dir, "siglip_validation.txt")
-            with open(log_path, "w") as f:
-                f.write("SIGLIP K-POOL VALIDATION LOG\n")
-                f.write("=" * 70 + "\n\n")
-                f.write(f"Min Votes: {min_votes}\n")
-                f.write(f"Min SigLIP Conf: {min_siglip_conf}, Temperature: {temperature}\n")
-                f.write(f"Synonym Threshold: {synonym_threshold}\n\n")
-                f.write(f"Total: {validation_stats['total']}, Validated: {validation_stats['validated']}\n")
-                f.write(f"Overrides: {validation_stats['overrides']}, Agreements: {validation_stats['agreements']}\n")
-                f.write(f"Synonym Overrides: {validation_stats['synonym_overrides']}\n\n")
-                f.write("=" * 70 + "\n\n")
-                
-                for e in sorted(validation_log, key=lambda x: -x['n_points']):
-                    status = "OVERRIDE" if e['overridden'] else "AGREE"
-                    f.write(f"Object ID: {e['obj_id']} [{status}]\n")
-                    f.write(f"  Points: {e['n_points']:,}\n")
-                    f.write(f"  SAM3:   {e['sam3_class']} (conf: {e['sam3_conf']:.1%})\n")
-                    f.write(f"  SigLIP: {e['siglip_class']} (conf: {e['siglip_conf']:.3f})\n")
-                    if e.get('text_sim', 0) > 0:
-                        f.write(f"  Text Sim: {e['text_sim']:.3f}\n")
-                    if e.get('override_reason'):
-                        f.write(f"  Reason: {e['override_reason']}\n")
-                    f.write(f"  Final:  {e['final_class']}\n")
-                    f.write(f"  K-Pool: [{e['candidates']}]\n\n")
-            print(f"[SigLIP-Val] Detailed log saved to: {log_path}")
-        
-        print(f"{Log.HEADER}================================{Log.END}\n")
+        print(f"[SigLIP-Val] {stats['validated']} validated, {stats['overrides']} overrides")
         return validated_labels
+
+def discover_scene_classes(loader, backbone, full_text_bank, config, device):
+    """Use SigLIP to discover which classes are present in a scene."""
+    discovery_frames = config.get("discovery_frames", 20)
+    top_k = config.get("top_k_classes", 40)
+    
+    class_names = list(full_text_bank.keys())
+    # Ensure consistent embedding shapes (squeeze any extra dims)
+    emb_list = []
+    for cn in class_names:
+        emb = full_text_bank[cn]
+        if emb.dim() > 1:
+            emb = emb.squeeze()
+        emb_list.append(emb)
+    text_embeds = torch.stack(emb_list).to(device)
+    text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
+    
+    class_scores = {cn: 0.0 for cn in class_names}
+    total_frames = len(loader)
+    
+    # UNIFORM SAMPLING: Sample frames across ENTIRE video, not just first N
+    frame_indices = np.linspace(0, total_frames - 1, min(discovery_frames, total_frames), dtype=int)
+    
+    print(f"[Discovery] Scanning {len(frame_indices)} frames uniformly across video (0 to {total_frames-1})...")
+    
+    for i in frame_indices:
+        _, rgb, _, _ = loader[i]  # Unpack tuple: (index, color, depth, pose)
+        
+        with torch.no_grad():
+            # Convert numpy to PIL for backbone
+            from PIL import Image
+            rgb_pil = Image.fromarray(rgb)
+            
+            # Use GLOBAL CLS token for discovery (more discriminative than patches)
+            if hasattr(backbone, 'encode_image_dense'):
+                _, global_cls = backbone.encode_image_dense(rgb_pil)
+                features = global_cls.squeeze()  # (D,) - global CLS token
+            else:
+                features = backbone.encode_image(rgb_pil).squeeze()  # (D,)
+            
+            features = features / features.norm(dim=-1, keepdim=True)
+            # Direct cosine similarity (no softmax - just accumulate raw sims)
+            sims = features @ text_embeds.T  # (200,)
+            
+            # Use raw similarity scores (not softmax) for better discrimination
+            for j, cn in enumerate(class_names):
+                class_scores[cn] = max(class_scores[cn], sims[j].item())
+    
+    # Debug: show top scores
+    sorted_scores = sorted(class_scores.items(), key=lambda x: -x[1])
+    print(f"[Discovery] Top 10 class scores: {[(cn, f'{s:.3f}') for cn, s in sorted_scores[:10]]}")
+    
+    # Just take top-k regardless of threshold (softmax spreads prob too thin across 200 classes)
+    discovered = [cn for cn, _ in sorted_scores[:top_k]]
+    
+    print(f"[Discovery] Selected top {len(discovered)} classes: {discovered[:10]}...")
+    return discovered
+
 
 def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode="ensemble", mask_mode="sam3", output_dir=None, script_dir=None, llm_prompts=None, sam3_selection_method="first", dataset_type="replica"):
     # 1. Output Directory Logic
@@ -3138,13 +3044,11 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
     
     # 2. Dataset Config - varies by dataset type
     if dataset_type in ["scannet", "scannet20", "scannet200"]:
-        # Determine eval config path based on dataset type
         if dataset_type == "scannet20":
             eval_config_path = os.path.join(script_dir, "scannet20.yaml") if script_dir else "scannet20.yaml"
-        else:  # scannet200 or scannet
+        else:
             eval_config_path = os.path.join(script_dir, "scannet200.yaml") if script_dir else "scannet200.yaml"
         
-        # ScanNet dataset path structure
         dataset_config = {
             "input_path": os.path.join(project_root, "scannet_data", "scans", scene),
             "H": c['H'],
@@ -3154,16 +3058,14 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "cx": c['cx'],
             "cy": c['cy'],
             "depth_scale": c['depth_scale'],
-            "frame_limit": 500,
+            "frame_limit": 5000,
             "distortion": [0,0,0,0,0],
             "crop_edge": c.get('crop_edge', 12),
             "depth_th": c.get('depth_th', 4.0),
-            "eval_config_path": eval_config_path  # Pass correct config path
+            "eval_config_path": eval_config_path
         }
-        # 3. Instantiate ScanNet Loader
         loader = ScanNet(dataset_config)
     else:
-        # Replica dataset (default)
         dataset_config = {
             "input_path": os.path.join(project_root, "Replica", scene),
             "H": c['H'],
@@ -3177,13 +3079,13 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "distortion": [0,0,0,0,0],
             "crop_edge": 0
         }
-        # 3. Instantiate Replica Loader
         loader = Replica(dataset_config)
+    
     if len(loader) == 0:
         print(f"[Error] No frames found in {dataset_config['input_path']}")
         return None
 
-    # 4. Setup Mask Generator (Internally constructed)
+    # 3. Setup Mask Generator Config
     weights_path = os.path.join(script_dir, "weights", "mobile_sam.pt") if script_dir else "weights/mobile_sam.pt"
     sam3_weights = os.path.join(script_dir, "weights", "sam3.pt") if script_dir else "weights/sam3.pt"
 
@@ -3197,12 +3099,95 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         "sam3_weights": sam3_weights
     }
 
-    # For sam3_semantic mode, pass text prompts for text-prompted segmentation
-    # IMPORTANT: SAM3 ALWAYS receives raw class names for fair comparison across prompt modes
-    # Only SigLIP text embeddings differ between ensemble/llm modes
-    sam3_prompt_mapping = {}  # Track which prompts were selected for SAM3
+    # 4. Setup Backbone & Text Embeddings
+    backbone = _SEMANTIC_CACHE[sem_cfg['name']]
+    
+    # 5. Load ScanNet200 embeddings (full 200 classes)
+    scannet200_cache = Path(script_dir) / "cache" / f"scannet200_{sem_cfg['name']}_embeddings.pt"
+    if isinstance(loader, ScanNet):
+        if scannet200_cache.exists():
+            print(f"[Cache] Loading pre-computed ScanNet200 embeddings from: {scannet200_cache}")
+            full_text_bank = torch.load(scannet200_cache, map_location=DEVICE)
+        else:
+            print(f"[Cache] No cache found. Generating embeddings for all 200 ScanNet classes...")
+            scannet200_config = os.path.join(script_dir, "scannet200.yaml")
+            with open(scannet200_config, 'r') as f:
+                all_classes = yaml.safe_load(f).get("class_names_reduced", [])
+            
+            full_text_bank = load_replica_text_embeddings(
+                backbone, DEVICE, all_classes,
+                cache_path=None, prompt_mode=prompt_mode, llm_prompts=llm_prompts
+            )
+            scannet200_cache.parent.mkdir(exist_ok=True)
+            torch.save(full_text_bank, scannet200_cache)
+            print(f"[Cache] Saved {len(full_text_bank)} embeddings to: {scannet200_cache}")
+        
+        # 6. SigLIP Class Discovery (academically clean - no GT leakage)
+        use_siglip_discovery = True  # Set to False for faster non-academic testing
+        
+        if use_siglip_discovery:
+            discovery_config = {
+                "discovery_frames": 1000,
+                "top_k_classes": 40,
+                "min_confidence": 0.01,  # Lower threshold - softmax across 200 classes spreads probability thin
+            }
+            discovered_classes = discover_scene_classes(loader, backbone, full_text_bank, discovery_config, DEVICE)
+            original_classes = loader.class_names  # These are the actual GT classes from aggregation.json
+            
+            # Validate discovery: how many GT classes were found?
+            gt_set = set(c.lower() for c in original_classes)
+            discovered_set = set(c.lower() for c in discovered_classes)
+            matched = gt_set & discovered_set
+            missed = gt_set - discovered_set
+            print(f"[Discovery] GT Validation: {len(matched)}/{len(original_classes)} GT classes discovered ({100*len(matched)/len(original_classes):.1f}%)")
+            if missed:
+                print(f"[Discovery] Missed GT classes: {list(missed)[:10]}")
+            
+            if discovered_classes and len(discovered_classes) > 0:
+                loader.class_names = discovered_classes
+                print(f"[Discovery] Replaced {len(original_classes)} GT classes with {len(discovered_classes)} SigLIP-discovered classes")
+            else:
+                print(f"[Discovery] WARNING: No classes discovered! Using original {len(original_classes)} GT classes")
+        
+        # 7. HYBRID: Per-scene embeddings for SAM3, full 200 for SigLIP validation
+        scene_text_bank = {}
+        raw_to_taxonomy = {}
+        for raw_label in loader.class_names:
+            if raw_label in full_text_bank:
+                scene_text_bank[raw_label] = full_text_bank[raw_label]
+            else:
+                variants = [raw_label.rstrip('s'), raw_label.replace(' cabinets', ' cabinet')]
+                matched = False
+                for variant in variants:
+                    if variant in full_text_bank:
+                        scene_text_bank[raw_label] = full_text_bank[variant]
+                        raw_to_taxonomy[raw_label] = variant
+                        matched = True
+                        break
+                if not matched:
+                    print(f"[Cache] Generating embedding for '{raw_label}'...")
+                    emb = load_replica_text_embeddings(backbone, DEVICE, [raw_label], cache_path=None, prompt_mode=prompt_mode, llm_prompts=llm_prompts)
+                    scene_text_bank[raw_label] = emb[raw_label]
+        
+        if raw_to_taxonomy:
+            print(f"[Cache] Mapped: {raw_to_taxonomy}")
+        print(f"[Cache] SAM3 uses {len(scene_text_bank)} per-scene embeddings")
+        print(f"[Cache] SigLIP validates against {len(full_text_bank)} classes")
+        backbone.full_text_bank = full_text_bank
+        backbone.scene_classes = getattr(loader, 'scene_classes', loader.class_names)
+    else:
+        # Replica: use per-scene embeddings as before
+        scene_text_bank = load_replica_text_embeddings(
+            backbone, DEVICE, loader.class_names,
+            cache_path=None, prompt_mode=prompt_mode, llm_prompts=llm_prompts
+        )
+        backbone.full_text_bank = None
+    
+    backbone.text_bank = scene_text_bank
+
+    # 8. Setup SAM3 prompts (AFTER potential discovery modification)
+    sam3_prompt_mapping = {}
     if mask_mode == "sam3_semantic":
-        # Always use raw class names for SAM3 (ensures comparable experiments)
         sam3_prompts = loader.class_names
         for cn in loader.class_names:
             sam3_prompt_mapping[cn] = {
@@ -3210,56 +3195,29 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
                 "all_prompts": [cn],
                 "method": "raw_class_name"
             }
-        print(f"[SAM3] Using raw class names for text-prompted segmentation (prompt_mode={prompt_mode} affects SigLIP only)")
+        print(f"[SAM3] Using {len(sam3_prompts)} class prompts for text-prompted segmentation")
     else:
         sam3_prompts = None
+    
     mask_gen = MaskGenerator(mask_gen_config, scene_name=scene, device=DEVICE, class_names=sam3_prompts)
     
-    # Save SAM3 prompt selection to output directory
     if output_dir and sam3_prompt_mapping:
         sam3_prompts_path = os.path.join(output_dir, "sam3_selected_prompts.json")
         with open(sam3_prompts_path, 'w') as f:
             json.dump(sam3_prompt_mapping, f, indent=2)
         print(f"[SAM3] Prompt selection saved to: {sam3_prompts_path}")
 
-    # 5. Setup Backbone & Text Embeddings
-    backbone = _SEMANTIC_CACHE[sem_cfg['name']]
-    
-    # Check for pre-computed ScanNet200 embeddings cache (200 classes)
-    scannet200_cache = Path(f"cache/scannet200_{sem_cfg['name']}_embeddings.pt")
-    if isinstance(loader, ScanNet) and scannet200_cache.exists():
-        print(f"[Cache] Loading pre-computed ScanNet200 embeddings from: {scannet200_cache}")
-        full_text_bank = torch.load(scannet200_cache, map_location=DEVICE)
-        
-        # Filter to scene classes OR use full 200 for SigLIP validation
-        scene_text_bank = {k: v for k, v in full_text_bank.items() if k in loader.class_names}
-        print(f"[Cache] Using {len(scene_text_bank)}/{len(full_text_bank)} embeddings for scene classes")
-        
-        # Store full bank for SigLIP validation (can query any of 200 classes)
-        backbone.full_text_bank = full_text_bank
-    else:
-        scene_text_bank = load_replica_text_embeddings(
-            backbone, 
-            DEVICE, 
-            loader.class_names, 
-            cache_path=None,
-            prompt_mode=prompt_mode,
-            llm_prompts=llm_prompts
-        )
-        backbone.full_text_bank = None  # No full bank available
-    
-    backbone.text_bank = scene_text_bank
-    # 6. Pipeline Config
+    # 9. Pipeline Config (Option 1: Conservative)
     pipeline_config = {
         "sem_name": sem_cfg['name'],
-        "max_frames": 5000,
+        "max_frames": 500,
         "mapping": { 
             "map_every": 10, 
             "downscale_ratio": 3,
             "k_pooling": 3,            
-            "max_frame_points": 80000,  # More points for accuracy
-            "max_total_points": 500000, # Allow larger point cloud
-            "voxel_size": 0.02          # 2cm voxel grid (finer)
+            "max_frame_points": 80000,
+            "max_total_points": 500000,
+            "voxel_size": 0.02
         },
         "tracking": { "track_every": 1 },
         "semantic": { "segment_every": 10 },
@@ -3278,27 +3236,27 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         "vis": { "stream": False },
         "siglip_validation": {
             "enabled": True,
-            "min_votes": 3,                # Require more votes for stable K-pool
-            "min_keyframes": 5,            # Filter noisy single-frame objects
-            "min_siglip_conf": 0.5,        # SigLIP must be this confident to override
-            "temperature": 0.1,            # Softmax temperature for K-pool
-            "synonym_threshold": 0.86,     # Text-embed cosine sim to detect near-synonyms
+            "min_votes": 3,
+            "min_keyframes": 5,
+            "min_siglip_conf": 0.5,
+            "temperature": 0.1,
+            "synonym_threshold": 0.86,
         },
-        "output_dir": output_dir, # <--- Passed here
+        "output_dir": output_dir,
         "device": DEVICE
     }
 
-    # 6. Pipeline Config
+    # 9b. Pipeline Config (Option 2: Aggressive - uncomment to use)
     pipeline_config = {
         "sem_name": sem_cfg['name'],
-        "max_frames": 5000,
+        "max_frames": 500,
         "mapping": { 
             "map_every": 10, 
             "downscale_ratio": 3,
             "k_pooling": 3,            
-            "max_frame_points": 80000,  # More points for accuracy
-            "max_total_points": 500000, # Allow larger point cloud
-            "voxel_size": 0.02          # 2cm voxel grid (finer)
+            "max_frame_points": 80000,
+            "max_total_points": 500000,
+            "voxel_size": 0.02
         },
         "tracking": { "track_every": 1 },
         "semantic": { "segment_every": 10 },
@@ -3316,17 +3274,17 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         "vis": { "stream": False },
         "siglip_validation": {
             "enabled": True,
-            "min_votes": 1,                # Allow validation of small objects
-            "min_keyframes": 1,            # Critical for ScanNet (objects appear in few frames)
-            "min_siglip_conf": 0.20,       # Balanced threshold
-            "temperature": 0.1,            # Softmax temperature for K-pool
-            "synonym_threshold": 0.86,     # Text-embed cosine sim to detect near-synonyms
+            "min_votes": 1,
+            "min_keyframes": 1,
+            "min_siglip_conf": 0.20,
+            "temperature": 0.1,
+            "synonym_threshold": 0.86,
         },
-        "output_dir": output_dir, # <--- Passed here
+        "output_dir": output_dir,
         "device": DEVICE
     }
 
-    # 7. Instantiate Pipeline
+    # 10. Instantiate Pipeline
     pipeline = ReplicaFusionPipeline(
         scene,
         pipeline_config,
@@ -3335,7 +3293,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         device=DEVICE
     )
 
-    # 8. Run
+    # 11. Run
     result = pipeline.run(mask_gen, pipeline.classifier, detailed_logging_enabled=pipeline_config.get("detailed_logging", False))
 
     # Cleanup
