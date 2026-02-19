@@ -105,7 +105,7 @@ LLM_USER_TEMPLATE_CUPL = """Answer these questions about "{class_name}" with sho
 5. Describe an image of a {class_name}:
 
 For each answer:
-- Give ONE short phrase (3-6 words)
+- Give ONE short phrase (3-4 words)
 - MUST include "{class_name}" in the phrase
 - Focus on visual appearance only
 
@@ -168,6 +168,7 @@ Rules:
 1. Each phrase MUST include "{class_name}"
 2. Each phrase MUST highlight a feature that {confusing_classes} do NOT have
 3. Be specific and concrete
+4. Must be short (3-4 words)
 
 One phrase per line, no numbering.
 IMPORTANT: Respond ONLY in English."""

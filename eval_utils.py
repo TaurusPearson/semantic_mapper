@@ -202,13 +202,17 @@ def eval_semantics(output_path: str, gt_path: str, scenes: List[str], dataset_in
     per_class_lines = []
     per_class_lines.append('\n classes \t IoU \t Acc')
     per_class_lines.append('----------------------------')
+    count = 0
     for i in range(num_classes):
         if i not in ignore:
             label_name = labels[i]
-            val_iou = iou_values[i]
-            val_acc = acc_values[i]
-            if not np.isnan(val_iou):
-                per_class_lines.append('{0:<14s}: {1:>5.2%}    {2:>6.2%}'.format(label_name, val_iou, val_acc))
+            val_iou = iou_values[count]
+            val_acc = acc_values[count]
+            count += 1
+            # Show ALL classes, including NaN (display as 0.00%)
+            display_iou = 0.0 if np.isnan(val_iou) else val_iou
+            display_acc = 0.0 if np.isnan(val_acc) else val_acc
+            per_class_lines.append('{0:<14s}: {1:>5.2%}    {2:>6.2%}'.format(label_name, display_iou, display_acc))
 
     # Add per-class stats to main report
     report_lines.extend(per_class_lines)
@@ -298,6 +302,14 @@ def update_confmat(confusion: np.ndarray, gt_ids: List[int], pr_ids: List[int], 
     valid_mask = np.ones_like(gt_ids, dtype=bool)
     for ig in ignore:
         valid_mask &= (gt_ids != ig)
+        valid_mask &= (pr_ids != ig)  # Also filter predictions with ignore values
+    
+    # Additional safety: filter out any negative indices to prevent wrap-around indexing
+    valid_mask &= (gt_ids >= 0) & (pr_ids >= 0)
+    
+    # Also filter out indices that exceed confusion matrix bounds
+    num_classes = confusion.shape[0]
+    valid_mask &= (gt_ids < num_classes) & (pr_ids < num_classes)
     
     gt_valid = gt_ids[valid_mask]
     pr_valid = pr_ids[valid_mask]

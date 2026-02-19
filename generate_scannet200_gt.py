@@ -281,10 +281,17 @@ def build_mapping_from_constants() -> dict:
         "nightstand": _NAME_TO_ID.get("nightstand", 0),
         "armchairs": _NAME_TO_ID.get("armchair", 0),
         "recliner": _NAME_TO_ID.get("armchair", 0),
+        "vacuum cleaner": _NAME_TO_ID.get("vacuum cleaner", 0),
+        "roomba": _NAME_TO_ID.get("vacuum cleaner", 0),
+        "robot vacuum": _NAME_TO_ID.get("vacuum cleaner", 0),
         "fireplace": _NAME_TO_ID.get("fireplace", 0),
         "fireplaces": _NAME_TO_ID.get("fireplace", 0),
         "mantel": _NAME_TO_ID.get("fireplace", 0),
         "mantle": _NAME_TO_ID.get("fireplace", 0),
+        # Breakfast/kitchen items
+        "breakfast bar": _NAME_TO_ID.get("bar", 0),
+        "snack bar": _NAME_TO_ID.get("bar", 0),
+        "counter bar": _NAME_TO_ID.get("bar", 0),
         "clocks": _NAME_TO_ID.get("clock", 0),
         "alarm clocks": _NAME_TO_ID.get("alarm clock", 0),
         "signs": _NAME_TO_ID.get("sign", 0),
@@ -313,6 +320,23 @@ def build_mapping_from_constants() -> dict:
         "telephone": _NAME_TO_ID.get("telephone", 0),
         "telephones": _NAME_TO_ID.get("telephone", 0),
         "phone": _NAME_TO_ID.get("telephone", 0),
+        # Misc items that map to 'object'
+        "banana holder": _NAME_TO_ID.get("object", 0),
+        "rice cooker": _NAME_TO_ID.get("object", 0),
+        "medal": _NAME_TO_ID.get("object", 0),
+        "trophy": _NAME_TO_ID.get("object", 0),
+        "award": _NAME_TO_ID.get("object", 0),
+        "fruit bowl": _NAME_TO_ID.get("bowl", 0),
+        "fruit basket": _NAME_TO_ID.get("basket", 0),
+        # Tools and containers
+        "toolbox": _NAME_TO_ID.get("box", 0),
+        "tool box": _NAME_TO_ID.get("box", 0),
+        # Paper items
+        "envelope": _NAME_TO_ID.get("paper", 0),
+        "envelopes": _NAME_TO_ID.get("paper", 0),
+        "mail": _NAME_TO_ID.get("paper", 0),
+        "letter": _NAME_TO_ID.get("paper", 0),
+        "letters": _NAME_TO_ID.get("paper", 0),
     }
     
     for alias, vid in aliases.items():

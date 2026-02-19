@@ -763,24 +763,22 @@ class ScanNet(BaseDataset):
             
             if dataset_type in ["scannet", "scannet20", "scannet200", "scannetv2"]:
                 self.eval_config = full_config
-                all_class_names = full_config.get("class_names_reduced", [])
-                self.map_to_reduced = self.eval_config.get("map_to_reduced", {})
-                self.ignore_ids = self.eval_config.get("ignore", [])
-                self.ignore_ids.extend(self.eval_config.get("background_reduced_ids", []))
+                self.map_to_reduced = {}  # No mapping - use raw labels
+                self.ignore_ids = []  # No ignored classes for raw label evaluation
                 
-                # Use per-scene filtered classes for SAM3 (for speed)
-                # But ensure proper mapping to full taxonomy at evaluation time
+                # Use RAW labels from aggregation.json directly
                 scene_classes = self._load_scene_classes()
                 if scene_classes:
-                    # Filter to only classes that exist in the full config
-                    self.class_names = [c for c in scene_classes if c in all_class_names]
-                    print(f"[ScanNet] Using per-scene classes: {len(self.class_names)} (filtered from {len(scene_classes)})", flush=True)
-                    # Store full taxonomy for evaluation
-                    self.full_class_names = all_class_names
+                    # Use raw labels AS-IS, no filtering
+                    self.class_names = scene_classes
+                    self.full_class_names = scene_classes
+                    print(f"[ScanNet] Using RAW per-scene classes: {self.class_names}", flush=True)
                 else:
+                    # Fallback to full taxonomy if aggregation.json not found
+                    all_class_names = full_config.get("class_names_reduced", [])
                     self.class_names = all_class_names
                     self.full_class_names = all_class_names
-                    print(f"[ScanNet] Using full ScanNet200 taxonomy: {len(self.class_names)} classes", flush=True)
+                    print(f"[ScanNet] Fallback to full taxonomy: {len(self.class_names)} classes", flush=True)
             else:
                 # Look for scannet section in config
                 if "scannet" in full_config:
@@ -791,27 +789,14 @@ class ScanNet(BaseDataset):
     
     def _load_scene_classes(self):
         """
-        Load class names from scene's aggregation file using standardized taxonomy.
+        Load RAW class names directly from scene's aggregation.json file.
         
-        Maps aggregation label IDs to class_names_reduced from scannet200.yaml
-        to ensure SAM3 uses proper taxonomy names that match ground truth.
+        Returns the original labels as-is (e.g., "breakfast bar", "yoga mat")
+        for true open-vocabulary evaluation.
         """
         scene_name = self.dataset_path.name
         
-        # Get full taxonomy from eval_config (already loaded in _load_eval_config)
-        all_class_names = self.eval_config.get("class_names_reduced", [])
-        if not all_class_names:
-            return None
-        
-        # Build ID -> class_name mapping from scannet200.yaml
-        valid_ids = self.eval_config.get("valid_class_ids", [])
-        if len(valid_ids) != len(all_class_names):
-            print(f"[ScanNet] Warning: valid_class_ids ({len(valid_ids)}) != class_names ({len(all_class_names)})", flush=True)
-            return None
-        
-        id_to_class = {vid: cname for vid, cname in zip(valid_ids, all_class_names)}
-        
-        # ScanNet aggregation file contains object instances with label IDs
+        # ScanNet aggregation file contains object instances with label strings
         agg_candidates = [
             self.dataset_path / f"{scene_name}.aggregation.json",
             self.dataset_path / f"{scene_name}_vh_clean.aggregation.json",
@@ -823,52 +808,21 @@ class ScanNet(BaseDataset):
                 with open(agg_path, 'r') as f:
                     agg_data = json.load(f)
                 
-                # Build reverse mapping: class_name -> label_id for quick lookup
-                class_to_id = {cname: vid for vid, cname in id_to_class.items()}
-                
                 unique_class_names = set()
                 if "segGroups" in agg_data:
                     for seg in agg_data["segGroups"]:
-                        # Get raw label string from aggregation file
-                        raw_label = seg.get("label", "").lower().strip()
+                        # Get raw label string directly - NO MAPPING
+                        raw_label = seg.get("label", "").strip()
                         
-                        if not raw_label or raw_label == "unannotated":
+                        if not raw_label or raw_label.lower() == "unannotated":
                             continue
                         
-                        # Try to find matching standardized class name
-                        matched = False
-                        
-                        # 1. Exact match (case-insensitive)
-                        for std_name in all_class_names:
-                            if raw_label == std_name.lower():
-                                unique_class_names.add(std_name)
-                                matched = True
-                                break
-                        
-                        if not matched:
-                            # 2. Handle plural -> singular (e.g., "doors" -> "door")
-                            if raw_label.endswith('s'):
-                                singular = raw_label[:-1]
-                                for std_name in all_class_names:
-                                    if singular == std_name.lower():
-                                        unique_class_names.add(std_name)
-                                        matched = True
-                                        break
-                        
-                        if not matched:
-                            # 3. Handle compound words (e.g., "piano bench" -> "bench")
-                            # Try matching the last word
-                            words = raw_label.split()
-                            if len(words) > 1:
-                                for std_name in all_class_names:
-                                    if words[-1] == std_name.lower():
-                                        unique_class_names.add(std_name)
-                                        matched = True
-                                        break
+                        # Use raw label as-is (preserving case for better prompts)
+                        unique_class_names.add(raw_label)
                 
                 if unique_class_names:
                     scene_classes = sorted(list(unique_class_names))
-                    print(f"[ScanNet] Loaded {len(scene_classes)} standardized classes from {agg_path.name}", flush=True)
+                    print(f"[ScanNet] Loaded {len(scene_classes)} RAW classes from {agg_path.name}: {scene_classes}", flush=True)
                     return scene_classes
             except Exception as e:
                 print(f"[ScanNet] Failed to load aggregation file: {e}", flush=True)
@@ -1724,9 +1678,14 @@ class SemanticMapper:
             if ins_id in self.objects:
                 self.objects[ins_id].add_top_kf(kf_id, mask_area)
 
-            # 4. Decoupled approach: always keep ALL views for CLIP extraction.
-            matched_ins_ids.append(ins_id)
-            maps_idxs.append(first_map_idx)
+            # 4. Filter: Do we keep this for CLIP processing?
+            # We only keep it if it's a Top View (or if Top-K is disabled by setting n=0)
+            if self.n_top_views <= 0 or self.objects[ins_id].is_top_kf(kf_id):
+                matched_ins_ids.append(ins_id)
+                maps_idxs.append(first_map_idx)
+            
+            # If it's NOT a top view, we silently drop it from the 'matched_ins_ids' list.
+            # This means it won't be sent to CLIP in the next step.
 
         # Filter the binary_maps tensor to only include the ones we kept
         if len(maps_idxs) > 0:
@@ -1745,8 +1704,20 @@ class SemanticMapper:
             return
 
         if len(matched_ins_ids) > 0:
-            # --- Decoupled approach: extract CLIP for ALL views ---
-            # Top-K selection happens in update_clip() for DBSCAN only.
+            # --- THIS IS THE CRITICAL OPTIMIZATION ---
+            if self.n_top_views > 0:
+                obj_to_compute = []
+                for j, ins_id in enumerate(matched_ins_ids):
+                    # Only calculate CLIP if this is one of the "Best" views for this object
+                    if ins_id in self.objects and self.objects[ins_id].is_top_kf(kf_id):
+                        obj_to_compute.append(j)
+                
+                if len(obj_to_compute) == 0:
+                    return
+                
+                # Filter down to just the "Top K" objects
+                matched_ins_ids = np.asarray(matched_ins_ids)[obj_to_compute].tolist()
+                binary_maps = binary_maps[obj_to_compute]
 
             # --- OVO Spec III.3: Async CLIP Processing ---
             if self.use_async_clip and self.async_clip is not None:
@@ -2378,30 +2349,22 @@ class ReplicaFusionPipeline:
         pcd_pred, _, pcd_ins_ids = self.mapper.get_map()
         
         # 2. Load Evaluation Config
-        # For ScanNet: Use FULL scannet200.yaml for evaluation (not filtered loader.class_names)
+        # For ScanNet: Use RAW labels from aggregation.json (per-scene open-vocabulary)
         # For Replica: Use eval_info.yaml class_names_reduced
         eval_config = {}
         
         if isinstance(self.loader, ScanNet):
-            # ScanNet: Use FULL taxonomy for evaluation
-            # loader.class_names are filtered per-scene classes (used for SAM3 segmentation)
-            # But evaluation must use ALL 200 classes to match ground truth
-            eval_config_path = "scannet200.yaml"
-            if not os.path.exists(eval_config_path):
-                eval_config_path = os.path.join(self.loader.dataset_path.parent.parent, "scannet200.yaml")
+            # ScanNet: Use RAW per-scene labels for true open-vocabulary evaluation
+            reduced_names = self.loader.class_names  # Raw labels from aggregation.json
+            print(f"[Eval] Using RAW per-scene labels: {reduced_names}")
             
-            if os.path.exists(eval_config_path):
-                with open(eval_config_path, 'r') as f:
-                    eval_config = yaml.safe_load(f)
-                reduced_names = eval_config.get("class_names_reduced", [])
-                print(f"[Eval] Using ScanNet200 full taxonomy: {len(reduced_names)} classes")
-                
-                # Map filtered predictions to full taxonomy
-                # loader.class_names are a subset of reduced_names
-                print(f"[Eval] SAM3 used {len(self.loader.class_names)} filtered classes for segmentation")
-            else:
-                print(f"{Log.RED}[Error] scannet200.yaml not found for evaluation!{Log.END}")
-                return None
+            # No mapping needed - predictions and GT both use raw label indices
+            eval_config = {
+                "class_names_reduced": reduced_names,
+                "num_classes": len(reduced_names),
+                "ignore": [-1],
+                "map_to_reduced": None  # No mapping for raw labels
+            }
         else:
             # Fallback to eval_info.yaml (Replica)
             eval_config_path = "eval_info.yaml"
@@ -2558,17 +2521,25 @@ class ReplicaFusionPipeline:
         np.savetxt(pred_txt_path, pred_labels_np, fmt="%d")
 
         # Find GT labels file
-        # Priority: scannet200_gt (fine-grained) > semantic_gt > Replica fallback
+        # Priority: raw_gt (per-scene raw labels) > scannet200_gt > semantic_gt > Replica fallback
         scannet_root = self.loader.dataset_path.parent.parent  # scannet_data/
         gt_txt_path = None
 
-        # 1. ScanNet200: pre-generated fine-grained GT labels (needs map_to_reduced)
-        scannet200_gt = scannet_root / "scannet200_gt" / f"{self.scene_name}.txt"
-        if scannet200_gt.exists():
-            gt_txt_path = scannet200_gt
-            print(f"[Eval] Using ScanNet200 GT: {gt_txt_path}")
+        # 1. RAW GT: per-scene raw labels from aggregation.json (for open-vocabulary eval)
+        if isinstance(self.loader, ScanNet):
+            raw_gt = scannet_root / "raw_gt" / f"{self.scene_name}.txt"
+            if raw_gt.exists():
+                gt_txt_path = raw_gt
+                print(f"[Eval] Using RAW GT (open-vocabulary): {gt_txt_path}")
 
-        # 2. semantic_gt (ScanNet20 / Replica)
+        # 2. ScanNet200: pre-generated fine-grained GT labels (needs map_to_reduced)
+        if gt_txt_path is None:
+            scannet200_gt = scannet_root / "scannet200_gt" / f"{self.scene_name}.txt"
+            if scannet200_gt.exists():
+                gt_txt_path = scannet200_gt
+                print(f"[Eval] Using ScanNet200 GT: {gt_txt_path}")
+
+        # 3. semantic_gt (ScanNet20 / Replica)
         if gt_txt_path is None:
             for candidate in [
                 self.loader.dataset_path.parent / "semantic_gt" / f"{self.scene_name}.txt",
@@ -2579,7 +2550,7 @@ class ReplicaFusionPipeline:
                     print(f"[Eval] Using semantic GT: {gt_txt_path}")
                     break
 
-        # 3. Replica fallback: scene directory
+        # 4. Replica fallback: scene directory
         if gt_txt_path is None:
             replica_gt = self.loader.dataset_path / f"{self.scene_name}.txt"
             if replica_gt.exists():
@@ -2589,24 +2560,9 @@ class ReplicaFusionPipeline:
         if gt_txt_path is not None and gt_txt_path.exists():
             print(f"[Eval] Comparing against GT: {gt_txt_path}")
 
-            # Ensure eval_config is loaded (contains map_to_reduced)
-            if not eval_config:
-                eval_config_path = "eval_info.yaml"
-                if not os.path.exists(eval_config_path):
-                    eval_config_path = os.path.join(self.loader.dataset_path, "eval_info.yaml")
-                if os.path.exists(eval_config_path):
-                    with open(eval_config_path, 'r') as f:
-                        eval_config = yaml.safe_load(f)
-                    print(f"[Eval] Loaded eval_config from: {eval_config_path}")
-
             dataset_info = eval_config.copy() if eval_config else {}
             dataset_info["num_classes"] = len(reduced_names)
             dataset_info["class_names"] = reduced_names
-
-            # map_to_reduced converts raw GT IDs → reduced class indices (0-N)
-            # ScanNet200 GT has fine-grained IDs (1-1191) → needs map_to_reduced
-            # Replica GT has raw IDs → needs map_to_reduced
-            # Both cases: KEEP map_to_reduced in dataset_info
 
             miou, _ = eval_utils.eval_semantics(
                 output_path=self.output_dir, 
@@ -3198,7 +3154,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "cx": c['cx'],
             "cy": c['cy'],
             "depth_scale": c['depth_scale'],
-            "frame_limit": 4000,
+            "frame_limit": 500,
             "distortion": [0,0,0,0,0],
             "crop_edge": c.get('crop_edge', 12),
             "depth_th": c.get('depth_th', 4.0),
@@ -3242,36 +3198,19 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
     }
 
     # For sam3_semantic mode, pass text prompts for text-prompted segmentation
-    # If using LLM mode, select best prompt per class; otherwise use raw class names
+    # IMPORTANT: SAM3 ALWAYS receives raw class names for fair comparison across prompt modes
+    # Only SigLIP text embeddings differ between ensemble/llm modes
     sam3_prompt_mapping = {}  # Track which prompts were selected for SAM3
     if mask_mode == "sam3_semantic":
-        if prompt_mode == "llm" and llm_prompts:
-            # Use configurable selection method to pick best prompt per class
-            sam3_prompts = []
-            for cn in loader.class_names:
-                class_prompts = llm_prompts.get(cn, [cn])
-                selected, selection_info = select_prompt_for_sam3(
-                    class_prompts, 
-                    method=sam3_selection_method,
-                    all_class_prompts=llm_prompts
-                )
-                sam3_prompts.append(selected)
-                sam3_prompt_mapping[cn] = {
-                    "selected_prompt": selected,
-                    "all_prompts": class_prompts,
-                    **selection_info
-                }
-            print(f"[SAM3] Using LLM prompts (method: {sam3_selection_method}) for text-prompted segmentation")
-        else:
-            # Use raw class names (OpenAI/ensemble approach)
-            sam3_prompts = loader.class_names
-            for cn in loader.class_names:
-                sam3_prompt_mapping[cn] = {
-                    "selected_prompt": cn,
-                    "all_prompts": [cn],
-                    "method": "raw_class_name"
-                }
-            print(f"[SAM3] Using raw class names for text-prompted segmentation")
+        # Always use raw class names for SAM3 (ensures comparable experiments)
+        sam3_prompts = loader.class_names
+        for cn in loader.class_names:
+            sam3_prompt_mapping[cn] = {
+                "selected_prompt": cn,
+                "all_prompts": [cn],
+                "method": "raw_class_name"
+            }
+        print(f"[SAM3] Using raw class names for text-prompted segmentation (prompt_mode={prompt_mode} affects SigLIP only)")
     else:
         sam3_prompts = None
     mask_gen = MaskGenerator(mask_gen_config, scene_name=scene, device=DEVICE, class_names=sam3_prompts)
@@ -3286,16 +3225,30 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
     # 5. Setup Backbone & Text Embeddings
     backbone = _SEMANTIC_CACHE[sem_cfg['name']]
     
-    scene_text_bank = load_replica_text_embeddings(
-        backbone, 
-        DEVICE, 
-        loader.class_names, 
-        cache_path=None,
-        prompt_mode=prompt_mode,
-        llm_prompts=llm_prompts
-    )
+    # Check for pre-computed ScanNet200 embeddings cache (200 classes)
+    scannet200_cache = Path(f"cache/scannet200_{sem_cfg['name']}_embeddings.pt")
+    if isinstance(loader, ScanNet) and scannet200_cache.exists():
+        print(f"[Cache] Loading pre-computed ScanNet200 embeddings from: {scannet200_cache}")
+        full_text_bank = torch.load(scannet200_cache, map_location=DEVICE)
+        
+        # Filter to scene classes OR use full 200 for SigLIP validation
+        scene_text_bank = {k: v for k, v in full_text_bank.items() if k in loader.class_names}
+        print(f"[Cache] Using {len(scene_text_bank)}/{len(full_text_bank)} embeddings for scene classes")
+        
+        # Store full bank for SigLIP validation (can query any of 200 classes)
+        backbone.full_text_bank = full_text_bank
+    else:
+        scene_text_bank = load_replica_text_embeddings(
+            backbone, 
+            DEVICE, 
+            loader.class_names, 
+            cache_path=None,
+            prompt_mode=prompt_mode,
+            llm_prompts=llm_prompts
+        )
+        backbone.full_text_bank = None  # No full bank available
+    
     backbone.text_bank = scene_text_bank
-
     # 6. Pipeline Config
     pipeline_config = {
         "sem_name": sem_cfg['name'],
@@ -3328,6 +3281,44 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "min_votes": 3,                # Require more votes for stable K-pool
             "min_keyframes": 5,            # Filter noisy single-frame objects
             "min_siglip_conf": 0.5,        # SigLIP must be this confident to override
+            "temperature": 0.1,            # Softmax temperature for K-pool
+            "synonym_threshold": 0.86,     # Text-embed cosine sim to detect near-synonyms
+        },
+        "output_dir": output_dir, # <--- Passed here
+        "device": DEVICE
+    }
+
+    # 6. Pipeline Config
+    pipeline_config = {
+        "sem_name": sem_cfg['name'],
+        "max_frames": 5000,
+        "mapping": { 
+            "map_every": 10, 
+            "downscale_ratio": 3,
+            "k_pooling": 3,            
+            "max_frame_points": 80000,  # More points for accuracy
+            "max_total_points": 500000, # Allow larger point cloud
+            "voxel_size": 0.02          # 2cm voxel grid (finer)
+        },
+        "tracking": { "track_every": 1 },
+        "semantic": { "segment_every": 10 },
+        "track_th": 50,
+        "th_centroid": 1.5,
+        "th_cossim": 0.80,
+        "match_distance_th": 0.05,
+        "clip": { 
+            "embed_type": "fused", 
+            "k_top_views": 10, 
+            "mask_res": 384
+        },
+        "sam": { "mask_res": 384, "nms_iou_th": 0.5, "nms_score_th": 0.8 },
+        "detailed_logging": False,
+        "vis": { "stream": False },
+        "siglip_validation": {
+            "enabled": True,
+            "min_votes": 1,                # Allow validation of small objects
+            "min_keyframes": 1,            # Critical for ScanNet (objects appear in few frames)
+            "min_siglip_conf": 0.20,       # Balanced threshold
             "temperature": 0.1,            # Softmax temperature for K-pool
             "synonym_threshold": 0.86,     # Text-embed cosine sim to detect near-synonyms
         },
@@ -3411,7 +3402,8 @@ def main():
         eval_config_path = os.path.join(script_dir, "scannet200.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
         SCENES = ["scene0011_00", "scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
-        SCENES = ["scene0011_00"]
+        # SCENES = ["scene0011_00"]
+        # SCENES = ["scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
     else:
         print(f"[Error] Unknown dataset: {CURRENT_DATASET}")
         return
