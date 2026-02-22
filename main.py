@@ -918,15 +918,32 @@ class SemanticClassifier:
                     if label in bank:
                         emb_list.append(bank[label].to(self.device))
                     else:
-                        print(f"{Log.RED}[Error] Class '{label}' missing from text bank!{Log.END}")
+                        # Generate embedding on-the-fly for missing classes
+                        print(f"{Log.YELLOW}[Warn] Class '{label}' missing from text bank - generating on-the-fly{Log.END}")
                         
-                        # --- Safe Dimension Access ---
-                        # Try to get dim from backbone, otherwise guess based on name
-                        dim = getattr(backbone, 'embed_dim', None)
-                        if dim is None:
-                            dim = 1152 if "siglip" in backbone.name else 768
-                        
-                        emb_list.append(torch.zeros(dim, device=self.device))
+                        try:
+                            # Use backbone's text encoder to generate embedding
+                            if hasattr(backbone, 'tokenizer') and hasattr(backbone, 'model'):
+                                tokens = backbone.tokenizer([label], context_length=64)
+                                tokens = tokens.to(self.device)
+                                with torch.no_grad():
+                                    text_emb = backbone.model.encode_text(tokens)
+                                    text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
+                                emb_list.append(text_emb.squeeze(0))
+                                print(f"  -> Generated embedding for '{label}'")
+                            else:
+                                # Fallback to zeros if no text encoder available
+                                dim = getattr(backbone, 'embed_dim', None)
+                                if dim is None:
+                                    dim = 1152 if "siglip" in backbone.name else 768
+                                emb_list.append(torch.zeros(dim, device=self.device))
+                                print(f"{Log.RED}[Error] No text encoder for '{label}' - using zeros{Log.END}")
+                        except Exception as e:
+                            print(f"{Log.RED}[Error] Failed to generate embedding for '{label}': {e}{Log.END}")
+                            dim = getattr(backbone, 'embed_dim', None)
+                            if dim is None:
+                                dim = 1152 if "siglip" in backbone.name else 768
+                            emb_list.append(torch.zeros(dim, device=self.device))
                         
                 self.text_emb = torch.stack(emb_list, dim=0)
             
@@ -3154,7 +3171,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             "cx": c['cx'],
             "cy": c['cy'],
             "depth_scale": c['depth_scale'],
-            "frame_limit": 500,
+            "frame_limit": 5000,
             "distortion": [0,0,0,0,0],
             "crop_edge": c.get('crop_edge', 12),
             "depth_th": c.get('depth_th', 4.0),
@@ -3404,6 +3421,7 @@ def main():
         SCENES = ["scene0011_00", "scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
         # SCENES = ["scene0011_00"]
         # SCENES = ["scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
+        SCENES = ["scene0050_00"]
     else:
         print(f"[Error] Unknown dataset: {CURRENT_DATASET}")
         return

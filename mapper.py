@@ -60,11 +60,22 @@ class SLAMMapper():
         mask = depth > 0
         
         if self.max_id>0:
-            camera_frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
-            frustum_mask = geometry_utils.compute_frustum_point_ids(self.pcd, camera_frustum_corners, device=self.device)                    
-            _, matches = geometry_utils.match_3d_points_to_2d_pixels(depth, torch.linalg.inv(c2w), self.pcd[frustum_mask], self.cam_intrinsics, self.match_distance_th)
-            mask[matches[:,1], matches[:,0]] = False # Do not project depth on points alredy matched
-            mask = self.pooling(mask)
+            try:
+                # Check diagonal elements (error message says "diagonal element 2 is zero")
+                diag = torch.diagonal(c2w[:3, :3])
+                if torch.any(torch.abs(diag) < 1e-6):
+                    print(f"[Mapper] Skipping frame - singular c2w matrix (near-zero diagonal)")
+                    mask = self.pooling(mask)
+                else:
+                    c2w_inv = torch.linalg.inv(c2w)
+                    camera_frustum_corners = geometry_utils.compute_camera_frustum_corners(depth, c2w, self.cam_intrinsics)
+                    frustum_mask = geometry_utils.compute_frustum_point_ids(self.pcd, camera_frustum_corners, device=self.device)                    
+                    _, matches = geometry_utils.match_3d_points_to_2d_pixels(depth, c2w_inv, self.pcd[frustum_mask], self.cam_intrinsics, self.match_distance_th)
+                    mask[matches[:,1], matches[:,0]] = False # Do not project depth on points alredy matched
+                    mask = self.pooling(mask)
+            except torch._C._LinAlgError as e:
+                print(f"[Mapper] Skipping frame - c2w inversion failed: {e}")
+                mask = self.pooling(mask)
 
         if mask.sum() == 0:
             return

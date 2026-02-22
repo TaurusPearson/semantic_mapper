@@ -104,10 +104,28 @@ def match_labels_to_vtx(points_3d_labels: torch.Tensor, points_3d: torch.Tensor,
         points_3d = points_3d[assigned_mask]
         assert len(points_3d_labels), "All points are unassigned"
     
-    if tree =="ball":
-        tree = BallTree(points_3d)
+    # Filter out NaN/Inf values that can occur from bad camera poses
+    if isinstance(points_3d, torch.Tensor):
+        valid_mask = torch.isfinite(points_3d).all(dim=1)
+        if not valid_mask.all():
+            n_invalid = (~valid_mask).sum().item()
+            print(f"[Eval] Warning: Filtering {n_invalid} points with NaN/Inf values")
+            points_3d = points_3d[valid_mask]
+            points_3d_labels = points_3d_labels[valid_mask]
+        points_3d_np = points_3d.cpu().numpy()
     else:
-        tree = KDTree(points_3d)
+        valid_mask = np.isfinite(points_3d).all(axis=1)
+        if not valid_mask.all():
+            n_invalid = (~valid_mask).sum()
+            print(f"[Eval] Warning: Filtering {n_invalid} points with NaN/Inf values")
+            points_3d = points_3d[valid_mask]
+            points_3d_labels = points_3d_labels[valid_mask]
+        points_3d_np = points_3d
+    
+    if tree =="ball":
+        tree = BallTree(points_3d_np)
+    else:
+        tree = KDTree(points_3d_np)
     distances, indices = tree.query(mesh_vtx, k=5)
 
     labels = points_3d_labels[indices]
