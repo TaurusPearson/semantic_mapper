@@ -39,6 +39,87 @@ class Log:
     def cls(msg):   print(f"{Log.GREEN}[CLASS]{Log.END} {msg}", flush=True)
 
 # -------------------------------------------------------------------------
+# SCENE CLASS DISCOVERY CACHE
+# -------------------------------------------------------------------------
+
+import json
+from datetime import datetime
+
+def _get_discovery_cache_path(project_root: str) -> str:
+    """Get path to the discovery cache file."""
+    cache_dir = os.path.join(project_root, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "discovery_cache.json")
+
+def load_discovery_cache(project_root: str) -> dict:
+    """Load the scene class discovery cache from disk."""
+    cache_path = _get_discovery_cache_path(project_root)
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"[Cache] Warning: Could not load discovery cache: {e}")
+            return {}
+    return {}
+
+def save_discovery_cache(project_root: str, cache: dict):
+    """Save the scene class discovery cache to disk."""
+    cache_path = _get_discovery_cache_path(project_root)
+    try:
+        with open(cache_path, 'w') as f:
+            json.dump(cache, f, indent=2)
+        print(f"[Cache] Discovery cache saved to: {cache_path}")
+    except IOError as e:
+        print(f"[Cache] Warning: Could not save discovery cache: {e}")
+
+def get_cached_discovery(project_root: str, scene: str, required_frames: int) -> list:
+    """
+    Get cached discovered classes if available and sufficient frames were processed.
+    
+    Args:
+        project_root: Root directory of the project
+        scene: Scene identifier (e.g., 'scene0011_00')
+        required_frames: Minimum number of frames required for discovery
+        
+    Returns:
+        List of discovered class names if cache hit, None if cache miss
+    """
+    cache = load_discovery_cache(project_root)
+    if scene in cache:
+        cached_entry = cache[scene]
+        cached_frames = cached_entry.get("frames_processed", 0)
+        if cached_frames >= required_frames:
+            print(f"[Cache] Discovery cache HIT for {scene}: {cached_frames} frames >= {required_frames} required")
+            print(f"[Cache] Using {len(cached_entry['discovered_classes'])} cached classes")
+            return cached_entry["discovered_classes"]
+        else:
+            print(f"[Cache] Discovery cache STALE for {scene}: {cached_frames} frames < {required_frames} required")
+    else:
+        print(f"[Cache] Discovery cache MISS for {scene}")
+    return None
+
+def update_discovery_cache(project_root: str, scene: str, discovered_classes: list, frames_processed: int):
+    """
+    Update the discovery cache with new results.
+    
+    Args:
+        project_root: Root directory of the project
+        scene: Scene identifier
+        discovered_classes: List of discovered class names
+        frames_processed: Number of frames used for discovery
+    """
+    cache = load_discovery_cache(project_root)
+    cache[scene] = {
+        "discovered_classes": discovered_classes,
+        "frames_processed": frames_processed,
+        "timestamp": datetime.now().isoformat(),
+        "num_classes": len(discovered_classes)
+    }
+    save_discovery_cache(project_root, cache)
+    print(f"[Cache] Updated discovery cache for {scene}: {len(discovered_classes)} classes from {frames_processed} frames")
+
+# -------------------------------------------------------------------------
 # FUSION & SIMILARITY UTILS (From HOV-SG / ConceptFusion)
 # -------------------------------------------------------------------------
 
@@ -103,6 +184,10 @@ class MaskGenerator:
             self._load_mobile_sam()
         elif self.model_type == "sam3_semantic":
             self._load_sam3_semantic()
+        elif self.model_type == "sam3_hybrid":
+            self._load_sam3_semantic()  # Load text-prompted SAM3
+            self._load_sam3_hf()        # Also load SAM3 HF for class-agnostic grid-based
+            print("[Hybrid] SAM3 loaded in both semantic and class-agnostic modes")
         else:
             self._load_sam3_hf()
 
@@ -195,6 +280,8 @@ class MaskGenerator:
             formatted_masks = self._segment_mobile(image_np)
         elif self.model_type == "sam3_semantic":
             return self._segment_sam3_semantic(image_np)  # Returns directly with class labels
+        elif self.model_type == "sam3_hybrid":
+            return self._segment_sam3_hybrid(image_np)  # Hybrid: text + class-agnostic
         else:
             formatted_masks = self._segment_sam3(image_np)
 
@@ -341,16 +428,25 @@ class MaskGenerator:
                 # Each mask corresponds to a detected instance
                 # We need to map back to class indices
                 if hasattr(result, 'boxes') and result.boxes is not None:
-                    # boxes.cls contains class indices
+                    # boxes.cls contains class indices, boxes.conf contains confidence
                     cls_ids = result.boxes.cls.cpu().numpy().astype(int)
+                    cls_confs = result.boxes.conf.cpu().numpy() if hasattr(result.boxes, 'conf') else np.ones(len(cls_ids))
                 else:
                     cls_ids = np.zeros(len(masks), dtype=int)
+                    cls_confs = np.ones(len(masks))
+                
+                # Filter by class confidence (only keep high-confidence detections)
+                min_class_conf = 0.3  # Minimum class confidence threshold
                 
                 # Sort by area (largest first) so smaller objects overlay larger ones
                 areas = [m.sum() for m in masks]
                 sorted_indices = np.argsort(areas)[::-1]
                 
                 for idx in sorted_indices:
+                    # Skip low-confidence class predictions
+                    if cls_confs[idx] < min_class_conf:
+                        continue
+                    
                     mask = masks[idx].astype(bool)
                     class_idx = cls_ids[idx] if idx < len(cls_ids) else 0
                     
@@ -369,6 +465,77 @@ class MaskGenerator:
             unique_classes = set(class_indices)
             class_names_detected = [self.class_names[i] if i < len(self.class_names) else f"idx{i}" for i in unique_classes]
             print(f"[SAM3-Sem] Frame detected {len(binary_stack)} masks, classes: {class_names_detected}")
+        
+        return seg_map, binary_maps
+
+    def _segment_sam3_hybrid(self, image_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Hybrid mode: Combine text-prompted SAM3 masks with class-agnostic SAM3 masks.
+        
+        Strategy:
+        1. Run SAM3 text-prompted to get masks with class labels
+        2. Run SAM3 class-agnostic (grid points) to catch objects text prompts missed
+        3. For pixels not covered by text-prompted masks, use class-agnostic masks
+        4. Class-agnostic masks get class_idx=-1 (to be classified by CLIP later)
+        """
+        h, w = image_np.shape[:2]
+        
+        # 1. Get SAM3 text-prompted masks (with class labels)
+        sem_seg_map, sem_binary_maps = self._segment_sam3_semantic(image_np)
+        sem_class_indices = list(self._last_class_indices) if hasattr(self, '_last_class_indices') else []
+        
+        # 2. Get SAM3 class-agnostic masks (grid-based)
+        agnostic_masks = self._segment_sam3(image_np)
+        
+        # Apply NMS to class-agnostic masks
+        if agnostic_masks:
+            agnostic_filtered, = segment_utils.masks_update(
+                agnostic_masks,
+                iou_thr=self.nms_iou_th,
+                score_thr=self.nms_score_th,
+                inner_thr=self.nms_inner_th
+            )
+            agnostic_filtered = sorted(agnostic_filtered, key=lambda x: x['area'], reverse=True)
+        else:
+            agnostic_filtered = []
+        
+        # 3. Build coverage mask from SAM3 text-prompted predictions
+        sem_coverage = (sem_seg_map >= 0)  # Pixels already assigned by text-prompted SAM3
+        
+        # 4. Merge: Add class-agnostic masks for uncovered regions
+        binary_stack = list(sem_binary_maps) if len(sem_binary_maps) > 0 else []
+        class_indices = list(sem_class_indices)
+        seg_map = sem_seg_map.copy()
+        
+        added_agnostic = 0
+        for m_dict in agnostic_filtered:
+            mask = m_dict['segmentation']
+            
+            # Check overlap with text-prompted coverage
+            overlap = np.sum(mask & sem_coverage)
+            mask_area = mask.sum()
+            
+            if mask_area == 0:
+                continue
+                
+            overlap_ratio = overlap / mask_area
+            
+            # Only add if <50% overlaps with text-prompted predictions (i.e., mostly new region)
+            if overlap_ratio < 0.5:
+                # Find uncovered portion
+                uncovered_mask = mask & ~sem_coverage
+                
+                if uncovered_mask.sum() > 100:  # Minimum area threshold
+                    mask_idx = len(binary_stack)
+                    seg_map[uncovered_mask] = mask_idx
+                    binary_stack.append(uncovered_mask)
+                    class_indices.append(-1)  # Mark as needing CLIP classification
+                    added_agnostic += 1
+        
+        binary_maps = np.array(binary_stack) if binary_stack else np.array([])
+        self._last_class_indices = class_indices
+        
+        print(f"[SAM3-Hybrid] {len(sem_binary_maps)} text-prompted + {added_agnostic} class-agnostic = {len(binary_stack)} total masks")
         
         return seg_map, binary_maps
 
@@ -1162,7 +1329,7 @@ class SemanticMapper:
         if not eval:
             assert cam_intrinsics is not None, "Camera intrinsics required for reconstruction!"
 
-        config["sam"]["multi_crop"] = False if config["clip"]["embed_type"] == "vanilla" else True
+        config["mask_gen"]["multi_crop"] = False if config["clip"]["embed_type"] == "vanilla" else True
         self.cam_intrinsics = cam_intrinsics
         self.config = config
         self.device = device
@@ -2031,6 +2198,13 @@ class ReplicaFusionPipeline:
         self.viz_process = None
         self.monitor = eval_utils.PerformanceMonitor()
         
+        # --- Cropped-Region CLS Feature Extraction (Toggle) ---
+        self.use_cropped_cls_features = config.get("siglip_validation", {}).get("use_cropped_cls", True)
+        self.crop_queue = []  # List of (obj_id, frame_id, bbox, rgb) tuples
+        self.cropped_cls_features = {}  # {obj_id: list of CLS features}
+        if self.use_cropped_cls_features:
+            print("[Pipeline] Cropped-region CLS feature extraction ENABLED")
+        
         rng = np.random.RandomState(42)
         self.viz_colors = rng.randint(0, 255, (5000, 3), dtype=np.uint8)
 
@@ -2190,6 +2364,21 @@ class ReplicaFusionPipeline:
                         self.mapper.update_pcd_obj_ids(updated_ids)
                     self.mapper.map_updated = False
                 
+                # 2. PERIODIC FUSION: Run instance fusion every 500 frames to prevent fragmentation
+                fusion_interval = self.config.get("fusion_interval", 500)
+                if frame_id > 0 and frame_id % fusion_interval == 0:
+                    n_objects_before = len(self.semantic_mapper.objects)
+                    updated_ids = self.semantic_mapper.update_map(
+                        self.mapper.get_map(),
+                        self.mapper.get_kfs(),
+                        classifier=classifier
+                    )
+                    if updated_ids is not None:
+                        self.mapper.update_pcd_obj_ids(updated_ids)
+                    n_objects_after = len(self.semantic_mapper.objects)
+                    if n_objects_before != n_objects_after:
+                        print(f"[Fusion@{frame_id}] Merged {n_objects_before} → {n_objects_after} objects")
+                
                 self.monitor.end_component("mapping")
 
             # E. OBJECT TRACKING (Semantic Association)
@@ -2197,15 +2386,22 @@ class ReplicaFusionPipeline:
                 self.monitor.start_component("semantics")
                 estimated_c2w = self.mapper.get_c2w(frame_id)
                 
-                # Get SAM3 class indices if available (for sam3_semantic mode)
-                sam3_class_indices = mask_generator.get_semantic_class_indices() if hasattr(mask_generator, 'get_semantic_class_indices') else []
+                # NEW: Per-mask CLIP classification (OVO-style)
+                use_clip_per_mask = self.config.get("use_clip_per_mask", False)
                 
-                # --- FIX: Map filtered per-scene class indices to full taxonomy indices ---
-                # This ensures Instance3D stores indices in the full 200-class taxonomy
-                if self.filtered_to_full_class_idx and sam3_class_indices:
-                    sam3_class_indices = [
-                        self.filtered_to_full_class_idx.get(idx, idx) for idx in sam3_class_indices
-                    ]
+                if use_clip_per_mask and binary_maps.shape[0] > 0:
+                    # Classify each mask using CLIP instead of SAM3 text prompts
+                    sam3_class_indices = self._classify_masks_with_clip(rgb, binary_maps, classifier)
+                else:
+                    # Get SAM3 class indices if available (for sam3_semantic mode)
+                    sam3_class_indices = mask_generator.get_semantic_class_indices() if hasattr(mask_generator, 'get_semantic_class_indices') else []
+                    
+                    # --- FIX: Map filtered per-scene class indices to full taxonomy indices ---
+                    # This ensures Instance3D stores indices in the full 200-class taxonomy
+                    if self.filtered_to_full_class_idx and sam3_class_indices:
+                        sam3_class_indices = [
+                            self.filtered_to_full_class_idx.get(idx, idx) for idx in sam3_class_indices
+                        ]
                 
                 if estimated_c2w is not None:
                     updated_obj_ids = self.semantic_mapper.detect_and_track_objects(
@@ -2218,6 +2414,14 @@ class ReplicaFusionPipeline:
                     )
                     if updated_obj_ids is not None:
                         self.mapper.update_pcd_obj_ids(updated_obj_ids)
+                    
+                    # Queue crops for cropped-region CLS features (if enabled)
+                    if self.use_cropped_cls_features and len(self.semantic_mapper.history) > 0:
+                        history_entry = self.semantic_mapper.history[0]
+                        mask_obj_ids = history_entry.get("ids", [])
+                        history_masks = history_entry.get("binary_maps", None)
+                        if mask_obj_ids is not None and history_masks is not None:
+                            self._queue_crops_for_frame(frame_id, rgb, history_masks, mask_obj_ids)
                 else:
                     print(f"[Warn] Frame {frame_id}: Tracking lost. Skipping semantics.")
                 self.monitor.end_component("semantics")
@@ -2342,12 +2546,55 @@ class ReplicaFusionPipeline:
             self.async_clip.stop()
             print(f"[AsyncCLIP] Final stats: {self.async_clip.items_processed} items, avg {self.async_clip.avg_process_time*1000:.1f}ms/item")
         
-        # 1b. Final instance fusion pass (replaces per-frame update_map)
+        # 1b. Pre-fusion: Consolidate semantic votes for nearby objects
+        # This enables fusion of fragmented objects that have different SAM3 class predictions
+        print("[Pipeline] Pre-fusion: Consolidating semantic votes for nearby objects...")
+        t_prefusion = time.time()
+        map_data = self.mapper.get_map()
+        points_3d, points_ids, points_ins_ids = map_data
+        
+        # Compute centroids for all objects
+        obj_centroids = {}
+        for obj_id, obj in self.semantic_mapper.objects.items():
+            obj_points = points_3d[points_ins_ids == obj_id]
+            if len(obj_points) > 0:
+                obj_centroids[obj_id] = obj_points.mean(dim=0)
+        
+        # Find nearby object pairs and consolidate votes
+        consolidation_th = self.config.get("th_centroid", 1.0) * 0.5  # Half of fusion threshold
+        consolidated_pairs = 0
+        obj_ids = list(obj_centroids.keys())
+        
+        for i, id1 in enumerate(obj_ids):
+            for id2 in obj_ids[i+1:]:
+                if id1 not in self.semantic_mapper.objects or id2 not in self.semantic_mapper.objects:
+                    continue
+                    
+                dist = ((obj_centroids[id1] - obj_centroids[id2]) ** 2).sum().sqrt().item()
+                if dist < consolidation_th:
+                    obj1 = self.semantic_mapper.objects[id1]
+                    obj2 = self.semantic_mapper.objects[id2]
+                    
+                    # Get majority class from combined votes
+                    combined_votes = dict(obj1.semantic_class_votes) if hasattr(obj1, 'semantic_class_votes') else {}
+                    if hasattr(obj2, 'semantic_class_votes'):
+                        for cls_idx, votes in obj2.semantic_class_votes.items():
+                            combined_votes[cls_idx] = combined_votes.get(cls_idx, 0) + votes
+                    
+                    if combined_votes:
+                        majority_class = max(combined_votes.keys(), key=lambda x: combined_votes[x])
+                        # Set both objects to majority class so fusion can merge them
+                        obj1.semantic_class_idx = majority_class
+                        obj2.semantic_class_idx = majority_class
+                        consolidated_pairs += 1
+        
+        print(f"[Pipeline] Pre-fusion: Consolidated {consolidated_pairs} nearby object pairs ({time.time() - t_prefusion:.2f}s)")
+        
+        # 1c. Final instance fusion pass (replaces per-frame update_map)
         # OVO only runs update_map on SLAM loop closures (rare). With vanilla SLAM there are none.
         # We run it ONCE here to merge duplicate instances before evaluation.
         print("[Pipeline] Running final instance fusion pass...")
         t_fusion = time.time()
-        map_data = self.mapper.get_map()
         updated_ids = self.semantic_mapper.update_map(map_data, self.mapper.get_kfs(), classifier=classifier)
         if updated_ids is not None:
             self.mapper.update_pcd_obj_ids(updated_ids)
@@ -2439,6 +2686,10 @@ class ReplicaFusionPipeline:
             filtered_classes = self.loader.class_names if hasattr(self.loader, 'class_names') else reduced_names
             print(f"[Eval] SAM3 indices already mapped to full taxonomy ({len(reduced_names)} classes)")
             
+            # --- Process Cropped-Region CLS Features (if enabled) ---
+            if self.use_cropped_cls_features and self.crop_queue:
+                self._process_crop_queue()
+            
             # --- SigLIP K-Pool Validation ---
             # Pass full taxonomy (reduced_names) since Instance3D stores full taxonomy indices
             validated_labels = self._validate_with_siglip_kpool(reduced_names)
@@ -2457,10 +2708,37 @@ class ReplicaFusionPipeline:
             matched_count = 0
             override_count = 0
             clip_fallback_count = 0
+            class_merge_count = 0
+            
+            # CLASS MERGING: Map similar classes to their canonical forms
+            # This fixes cabinet/kitchen cabinet, counter/kitchen counter confusion
+            class_merge_map = {}
+            merge_rules = [
+                ("cabinet", "kitchen cabinet"),      # cabinet → kitchen cabinet
+                ("counter", "kitchen counter"),      # counter → kitchen counter  
+                ("trash bin", "trash can"),          # trash bin → trash can
+                ("doorframe", "door"),               # doorframe → door (semantic equivalence)
+            ]
+            for src, dst in merge_rules:
+                if src in reduced_names and dst in reduced_names:
+                    class_merge_map[reduced_names.index(src)] = reduced_names.index(dst)
+            
+            if class_merge_map:
+                print(f"[Eval] Class merging enabled: {len(class_merge_map)} mappings")
+                for src_idx, dst_idx in class_merge_map.items():
+                    print(f"  - {reduced_names[src_idx]} → {reduced_names[dst_idx]}")
             
             for obj_id in ordered_obj_ids:
                 obj = self.semantic_mapper.objects[obj_id]
-                sam3_class = obj.semantic_class_idx
+                
+                # FIX: Compute vote winner from semantic_class_votes, not initial semantic_class_idx
+                sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
+                total_votes = sum(sam3_votes.values())
+                if total_votes > 0:
+                    sorted_votes = sorted(sam3_votes.items(), key=lambda x: -x[1])
+                    sam3_class = sorted_votes[0][0]  # Vote winner
+                else:
+                    sam3_class = obj.semantic_class_idx  # Fallback to initial
                 
                 if obj_id in validated_labels:
                     # High-vote objects: use SAM3 + SigLIP validated label
@@ -2898,10 +3176,449 @@ class ReplicaFusionPipeline:
                     else:
                         f.write(f"  Vote Distribution: (no votes)\n")
             print(f"\n[VoteDiag] Detailed log saved to: {log_path}")
+        
+        # Generate instance predictions diagnostic with GT labels
+        if hasattr(self, '_view_diagnostics_cache') and self._view_diagnostics_cache:
+            self._generate_instance_predictions_diagnostic(self._view_diagnostics_cache, gt_instance_labels)
+        else:
+            # Fallback: generate with dense features only (no 4-view)
+            self._generate_instance_predictions_simple(gt_instance_labels, class_names)
+        
         print(f"{Log.HEADER}======================================{Log.END}\n")
 
+    def _classify_masks_with_clip(self, rgb, binary_maps, classifier, frame_id=None):
+        """
+        Classify each mask using CLIP instead of SAM3 text prompts.
+        This is the OVO-style approach: class-agnostic masks + per-mask CLIP classification.
+        
+        Args:
+            rgb: RGB image (H, W, 3)
+            binary_maps: Tensor of binary masks (N, H, W)
+            classifier: SemanticClassifier with labels and text embeddings
+            frame_id: Optional frame ID for logging
+            
+        Returns:
+            List of class indices, one per mask
+        """
+        from PIL import Image
+        
+        n_masks = binary_maps.shape[0]
+        if n_masks == 0:
+            return []
+        
+        class_indices = []
+        backbone = _SEMANTIC_CACHE.get(self.config.get('sem_name'))
+        
+        if backbone is None or not hasattr(backbone, 'full_text_bank'):
+            return [-1] * n_masks
+        
+        full_text_bank = backbone.full_text_bank
+        if full_text_bank is None:
+            return [-1] * n_masks
+        
+        class_names = list(full_text_bank.keys())
+        text_embeds = torch.stack([full_text_bank[cn].squeeze() for cn in class_names]).to(self.device)
+        text_embeds = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-6)
+        
+        rgb_pil = Image.fromarray(rgb)
+        log_entries = []
+        
+        with torch.no_grad():
+            for i in range(n_masks):
+                mask = binary_maps[i].cpu().numpy()
+                
+                ys, xs = np.where(mask)
+                if len(ys) == 0:
+                    class_indices.append(-1)
+                    continue
+                
+                x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                
+                h, w = mask.shape
+                pad = max(10, int(0.1 * max(x2-x1, y2-y1)))
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
+                
+                crop = rgb_pil.crop((x1, y1, x2, y2))
+                mask_area = int(mask.sum())
+                
+                if hasattr(backbone, 'encode_image'):
+                    img_feat = backbone.encode_image(crop).squeeze()
+                    img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                    
+                    sims = img_feat @ text_embeds.T
+                    probs = torch.softmax(sims / 0.1, dim=-1)
+                    best_idx = probs.argmax().item()
+                    best_conf = probs[best_idx].item()
+                    
+                    # Get top 3 for logging
+                    top3_vals, top3_idx = probs.topk(3)
+                    top3 = [(class_names[idx], top3_vals[j].item()) for j, idx in enumerate(top3_idx.tolist())]
+                    
+                    log_entries.append({
+                        "mask_idx": i, "area": mask_area,
+                        "predicted": class_names[best_idx], "confidence": best_conf, "top3": top3
+                    })
+                    class_indices.append(best_idx)
+                else:
+                    class_indices.append(-1)
+        
+        # Write per-frame log
+        if log_entries and self.output_dir:
+            clip_log_path = os.path.join(self.output_dir, "clip_per_mask_log.txt")
+            mode = 'a' if os.path.exists(clip_log_path) else 'w'
+            with open(clip_log_path, mode) as f:
+                if mode == 'w':
+                    f.write("=== PER-MASK CLIP CLASSIFICATION LOG ===\n\n")
+                f.write(f"\n--- Frame {frame_id} ({len(log_entries)} masks) ---\n")
+                for entry in log_entries:
+                    top3_str = ", ".join([f"{cn}:{c:.3f}" for cn, c in entry['top3']])
+                    f.write(f"  Mask {entry['mask_idx']}: {entry['predicted']} ({entry['confidence']:.3f}) | area={entry['area']} | top3=[{top3_str}]\n")
+        
+        return class_indices
+
+    def _queue_crops_for_frame(self, frame_id, rgb, binary_maps, obj_ids):
+        """Queue cropped regions AND global image for later CLS feature extraction.
+        
+        Args:
+            frame_id: Current frame ID
+            rgb: RGB image (H, W, 3)
+            binary_maps: Tensor of binary masks (N, H, W)
+            obj_ids: List of object IDs corresponding to masks
+        """
+        if not self.use_cropped_cls_features:
+            return
+        
+        n_masks = binary_maps.shape[0] if binary_maps.numel() > 0 else 0
+        
+        # Debug: Check obj_ids type and content
+        if isinstance(obj_ids, torch.Tensor):
+            obj_ids = obj_ids.cpu().numpy().tolist()
+        elif isinstance(obj_ids, np.ndarray):
+            obj_ids = obj_ids.tolist()
+        
+        if frame_id == 0 or frame_id % 50 == 0:
+            print(f"[4-View Debug] Frame {frame_id}: {n_masks} masks, {len(obj_ids) if obj_ids else 0} obj_ids, queue={len(self.crop_queue)}")
+        
+        # Store global image once per frame (downscaled to save memory)
+        global_rgb = rgb[::2, ::2].copy()  # 2x downscale
+        
+        for i in range(min(n_masks, len(obj_ids))):
+            obj_id = obj_ids[i]
+            if obj_id < 0:
+                continue
+            
+            mask = binary_maps[i].cpu().numpy() if isinstance(binary_maps[i], torch.Tensor) else binary_maps[i]
+            ys, xs = np.where(mask)
+            if len(ys) == 0:
+                continue
+            
+            # Compute bounding box with padding
+            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+            h, w = mask.shape
+            pad = max(20, int(0.15 * max(x2-x1, y2-y1)))  # 15% padding for context
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(w, x2 + pad)
+            y2 = min(h, y2 + pad)
+            
+            # Store crop, mask, and global image for 4-view features
+            # Crop with padding (bbox view)
+            crop_bbox = rgb[y1:y2, x1:x2].copy()
+            mask_crop = mask[y1:y2, x1:x2].copy()
+            
+            # Tight crop (no padding) for cropped view
+            x1_tight, y1_tight = xs.min(), ys.min()
+            x2_tight, y2_tight = xs.max(), ys.max()
+            crop_tight = rgb[y1_tight:y2_tight, x1_tight:x2_tight].copy()
+            
+            # Store: obj_id, frame_id, tight_crop, bbox_crop, mask_crop, global_rgb, full_rgb, full_mask
+            self.crop_queue.append((obj_id, frame_id, crop_tight, crop_bbox, mask_crop, global_rgb, rgb.copy(), mask.copy()))
+
+    def _process_crop_queue(self):
+        """Process queued crops and extract 4-VIEW features for diagnostic.
+        
+        Returns:
+            dict: {obj_id: combined feature tensor}
+        """
+        if not self.crop_queue:
+            return {}
+        
+        print(f"[4-View] Processing {len(self.crop_queue)} queued crops...")
+        
+        from PIL import Image
+        backbone = _SEMANTIC_CACHE.get(self.config.get('sem_name'))
+        
+        if backbone is None:
+            print("[4-View] WARNING: No backbone available!")
+            return {}
+        
+        # Group by object ID
+        obj_data = {}
+        for item in self.crop_queue:
+            obj_id, frame_id, crop_tight, crop_bbox, mask_crop, global_rgb, full_rgb, full_mask = item
+            if obj_id not in obj_data:
+                obj_data[obj_id] = []
+            obj_data[obj_id].append({
+                "crop_tight": crop_tight, "crop_bbox": crop_bbox,
+                "global_rgb": global_rgb, "full_rgb": full_rgb, "full_mask": full_mask
+            })
+        
+        cropped_features = {}
+        view_diagnostics = {}
+        max_views = 5
+        
+        with torch.no_grad():
+            for obj_id, views in obj_data.items():
+                if len(views) > max_views:
+                    indices = np.linspace(0, len(views)-1, max_views, dtype=int)
+                    views = [views[i] for i in indices]
+                
+                cropped_feats, bbox_feats, dense_feats, global_feats = [], [], [], []
+                
+                for v in views:
+                    try:
+                        # 1. CROPPED (tight)
+                        crop_pil = Image.fromarray(v["crop_tight"])
+                        if hasattr(backbone, 'encode_image_dense'):
+                            _, crop_cls = backbone.encode_image_dense(crop_pil)
+                        else:
+                            crop_cls = backbone.encode_image(crop_pil)
+                        crop_cls = crop_cls.squeeze()
+                        crop_cls = crop_cls / (crop_cls.norm() + 1e-6)
+                        cropped_feats.append(crop_cls)
+                        
+                        # 2. BBOX (with padding)
+                        bbox_pil = Image.fromarray(v["crop_bbox"])
+                        if hasattr(backbone, 'encode_image_dense'):
+                            _, bbox_cls = backbone.encode_image_dense(bbox_pil)
+                        else:
+                            bbox_cls = backbone.encode_image(bbox_pil)
+                        bbox_cls = bbox_cls.squeeze()
+                        bbox_cls = bbox_cls / (bbox_cls.norm() + 1e-6)
+                        bbox_feats.append(bbox_cls)
+                        
+                        # 3. GLOBAL
+                        global_pil = Image.fromarray(v["global_rgb"])
+                        if hasattr(backbone, 'encode_image_dense'):
+                            _, global_cls = backbone.encode_image_dense(global_pil)
+                        else:
+                            global_cls = backbone.encode_image(global_pil)
+                        global_cls = global_cls.squeeze()
+                        global_cls = global_cls / (global_cls.norm() + 1e-6)
+                        global_feats.append(global_cls)
+                        
+                        # 4. DENSE (mask-pooled) - simplified for now
+                        dense_feats.append(crop_cls)  # Use cropped as proxy
+                        
+                    except Exception as e:
+                        continue
+                
+                if cropped_feats:
+                    avg_cropped = torch.stack(cropped_feats).mean(dim=0)
+                    avg_cropped = avg_cropped / (avg_cropped.norm() + 1e-6)
+                    avg_bbox = torch.stack(bbox_feats).mean(dim=0)
+                    avg_bbox = avg_bbox / (avg_bbox.norm() + 1e-6)
+                    avg_global = torch.stack(global_feats).mean(dim=0)
+                    avg_global = avg_global / (avg_global.norm() + 1e-6)
+                    
+                    # Combined: weighted average
+                    combined = 0.5 * avg_cropped + 0.3 * avg_bbox + 0.2 * avg_global
+                    combined = combined / (combined.norm() + 1e-6)
+                    cropped_features[obj_id] = combined
+                    
+                    view_diagnostics[obj_id] = {
+                        "cropped_feat": avg_cropped,
+                        "bbox_feat": avg_bbox,
+                        "global_feat": avg_global,
+                        "n_views": len(cropped_feats)
+                    }
+        
+        # Generate consolidated diagnostic
+        self._generate_instance_predictions_diagnostic(view_diagnostics)
+        
+        print(f"[4-View] Features for {len(cropped_features)} objects")
+        self.cropped_cls_features = cropped_features
+        self.crop_queue = []
+        return cropped_features
+
+    def _generate_instance_predictions_diagnostic(self, view_diagnostics, gt_labels=None):
+        """Generate instance_predictions.txt with 4 SigLIP views + SAM3 + GT."""
+        if not view_diagnostics or not hasattr(self, 'output_dir') or not self.output_dir:
+            return
+        backbone = _SEMANTIC_CACHE.get(self.config.get('sem_name'))
+        if backbone is None or not hasattr(backbone, 'full_text_bank'):
+            return
+        full_text_bank = backbone.full_text_bank
+        if not full_text_bank:
+            return
+        class_names = list(full_text_bank.keys())
+        text_embeds = torch.stack([full_text_bank[cn].squeeze() for cn in class_names]).to(self.device)
+        text_embeds = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-6)
+        sam3_class_names = getattr(self.semantic_mapper, 'class_names', class_names)
+        gt_labels = gt_labels or {}
+        
+        def classify_view(feat, temp=1.0):
+            if feat.dim() == 1:
+                feat = feat.unsqueeze(0)
+            sims = (feat @ text_embeds.T).squeeze()
+            probs = torch.softmax(sims / temp, dim=-1)
+            top3_vals, top3_idx = probs.topk(3)
+            return {
+                "top1": class_names[top3_idx[0].item()], "conf": top3_vals[0].item(),
+                "top3": [(class_names[idx.item()], top3_vals[i].item()) for i, idx in enumerate(top3_idx)],
+                "raw_range": sims.max().item() - sims.min().item()
+            }
+        
+        log_entries = []
+        with torch.no_grad():
+            for obj_id, diag in view_diagnostics.items():
+                obj = self.semantic_mapper.objects.get(obj_id)
+                sam3_class, sam3_conf, n_points, n_kf = "unknown", 0.0, 0, 0
+                sam3_votes_str = []
+                if obj:
+                    sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
+                    total_votes = sum(sam3_votes.values())
+                    n_points = len(obj.pts_ids) if hasattr(obj, 'pts_ids') else 0
+                    n_kf = len(obj.kfs_ids) if hasattr(obj, 'kfs_ids') else 0
+                    if total_votes > 0:
+                        sorted_votes = sorted(sam3_votes.items(), key=lambda x: -x[1])
+                        sam3_idx = sorted_votes[0][0]
+                        sam3_conf = sorted_votes[0][1] / total_votes
+                        sam3_class = sam3_class_names[sam3_idx] if 0 <= sam3_idx < len(sam3_class_names) else f"idx_{sam3_idx}"
+                        for cls_idx, votes in sorted_votes[:3]:
+                            cls_name = sam3_class_names[cls_idx] if 0 <= cls_idx < len(sam3_class_names) else f"idx_{cls_idx}"
+                            sam3_votes_str.append(f"{cls_name}: {votes} ({100*votes/total_votes:.0f}%)")
+                cropped_res = classify_view(diag["cropped_feat"].to(self.device))
+                bbox_res = classify_view(diag["bbox_feat"].to(self.device))
+                global_res = classify_view(diag["global_feat"].to(self.device))
+                dense_res = {"top1": "N/A", "conf": 0, "top3": [], "raw_range": 0}
+                if obj and obj.clip_feature is not None:
+                    dense_res = classify_view(obj.clip_feature.to(self.device))
+                gt_class = gt_labels.get(obj_id, "N/A") if gt_labels else "N/A"
+                log_entries.append({
+                    "obj_id": obj_id, "n_points": n_points, "n_kf": n_kf, "n_views": diag["n_views"],
+                    "gt_class": gt_class, "sam3_class": sam3_class, "sam3_conf": sam3_conf, "sam3_votes": sam3_votes_str,
+                    "dense": dense_res, "cropped": cropped_res, "bbox": bbox_res, "global": global_res
+                })
+                # Store predictions in view_diagnostics for view voting override
+                view_diagnostics[obj_id]["cropped_pred"] = cropped_res["top1"]
+                view_diagnostics[obj_id]["bbox_pred"] = bbox_res["top1"]
+                view_diagnostics[obj_id]["dense_pred"] = dense_res["top1"]
+        
+        self._view_diagnostics_cache = view_diagnostics
+        log_path = os.path.join(self.output_dir, "instance_predictions.txt")
+        n_with_gt = sum(1 for e in log_entries if e['gt_class'] != "N/A")
+        n_sam3_correct = sum(1 for e in log_entries if e['gt_class'] != "N/A" and e['sam3_class'] == e['gt_class'])
+        
+        with open(log_path, 'w') as f:
+            f.write("=== INSTANCE PREDICTIONS DIAGNOSTIC ===\n")
+            f.write("GT vs SAM3 vs SigLIP 4-view predictions\n\n")
+            f.write(f"Objects: {len(log_entries)} | With GT: {n_with_gt} | SAM3 correct: {n_sam3_correct}/{n_with_gt}\n\n")
+            for e in sorted(log_entries, key=lambda x: -x["n_points"]):
+                gt_match = "CORRECT" if e['gt_class'] == e['sam3_class'] else "WRONG" if e['gt_class'] != "N/A" else ""
+                f.write(f"Object ID: {e['obj_id']} | Points: {e['n_points']:,} | KF: {e['n_kf']} [{gt_match}]\n")
+                f.write(f"  GT: {e['gt_class']}\n")
+                f.write(f"  SAM3: {e['sam3_class']} ({100*e['sam3_conf']:.0f}%)\n")
+                if e['sam3_votes']:
+                    f.write(f"    Votes: {'; '.join(e['sam3_votes'])}\n")
+                f.write(f"  SigLIP Views:\n")
+                for vn, vk in [("Dense", "dense"), ("Cropped", "cropped"), ("BBox", "bbox"), ("Global", "global")]:
+                    v = e[vk]
+                    t3 = ", ".join([cn[:10] for cn, _ in v["top3"][:3]]) if v["top3"] else "N/A"
+                    gt_marker = " <-- GT" if v['top1'] == e['gt_class'] else ""
+                    f.write(f"    {vn:<8}: {v['top1']:<18} {100*v['conf']:.1f}% (range={v['raw_range']:.3f}) [{t3}]{gt_marker}\n")
+                f.write("\n")
+        if n_with_gt > 0:
+            print(f"[Diagnostic] instance_predictions.txt: {len(log_entries)} objects ({n_sam3_correct}/{n_with_gt} SAM3 correct)")
+
+    def _generate_instance_predictions_simple(self, gt_labels, class_names):
+        """Fallback: Generate instance_predictions.txt using only dense features (no 4-view)."""
+        if not hasattr(self, 'output_dir') or not self.output_dir:
+            return
+        backbone = _SEMANTIC_CACHE.get(self.config.get('sem_name'))
+        if backbone is None or not hasattr(backbone, 'full_text_bank'):
+            return
+        full_text_bank = backbone.full_text_bank
+        if not full_text_bank:
+            return
+        full_class_names = list(full_text_bank.keys())
+        text_embeds = torch.stack([full_text_bank[cn].squeeze() for cn in full_class_names]).to(self.device)
+        text_embeds = text_embeds / (text_embeds.norm(dim=-1, keepdim=True) + 1e-6)
+        sam3_class_names = getattr(self.semantic_mapper, 'class_names', class_names)
+        
+        log_entries = []
+        with torch.no_grad():
+            for obj_id, obj in self.semantic_mapper.objects.items():
+                sam3_class, sam3_conf, n_points, n_kf = "unknown", 0.0, 0, 0
+                sam3_votes_str = []
+                sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
+                total_votes = sum(sam3_votes.values())
+                n_points = len(obj.pts_ids) if hasattr(obj, 'pts_ids') else 0
+                n_kf = len(obj.kfs_ids) if hasattr(obj, 'kfs_ids') else 0
+                if total_votes > 0:
+                    sorted_votes = sorted(sam3_votes.items(), key=lambda x: -x[1])
+                    sam3_idx = sorted_votes[0][0]
+                    sam3_conf = sorted_votes[0][1] / total_votes
+                    sam3_class = sam3_class_names[sam3_idx] if 0 <= sam3_idx < len(sam3_class_names) else f"idx_{sam3_idx}"
+                    for cls_idx, votes in sorted_votes[:3]:
+                        cls_name = sam3_class_names[cls_idx] if 0 <= cls_idx < len(sam3_class_names) else f"idx_{cls_idx}"
+                        sam3_votes_str.append(f"{cls_name}: {votes} ({100*votes/total_votes:.0f}%)")
+                
+                dense_res = {"top1": "N/A", "conf": 0, "top3": [], "raw_range": 0}
+                if obj.clip_feature is not None:
+                    feat = obj.clip_feature.to(self.device)
+                    if feat.dim() == 1:
+                        feat = feat.unsqueeze(0)
+                    sims = (feat @ text_embeds.T).squeeze()
+                    probs = torch.softmax(sims / 1.0, dim=-1)
+                    top3_vals, top3_idx = probs.topk(3)
+                    dense_res = {
+                        "top1": full_class_names[top3_idx[0].item()], "conf": top3_vals[0].item(),
+                        "top3": [(full_class_names[idx.item()], top3_vals[i].item()) for i, idx in enumerate(top3_idx)],
+                        "raw_range": sims.max().item() - sims.min().item()
+                    }
+                gt_class = gt_labels.get(obj_id, "N/A")
+                log_entries.append({
+                    "obj_id": obj_id, "n_points": n_points, "n_kf": n_kf,
+                    "gt_class": gt_class, "sam3_class": sam3_class, "sam3_conf": sam3_conf,
+                    "sam3_votes": sam3_votes_str, "dense": dense_res
+                })
+        
+        log_path = os.path.join(self.output_dir, "instance_predictions.txt")
+        n_with_gt = sum(1 for e in log_entries if e['gt_class'] != "N/A")
+        n_sam3_correct = sum(1 for e in log_entries if e['gt_class'] != "N/A" and e['sam3_class'] == e['gt_class'])
+        n_siglip_correct = sum(1 for e in log_entries if e['gt_class'] != "N/A" and e['dense']['top1'] == e['gt_class'])
+        
+        with open(log_path, 'w') as f:
+            f.write("=== INSTANCE PREDICTIONS DIAGNOSTIC ===\n")
+            f.write("GT vs SAM3 vs SigLIP (dense features only)\n\n")
+            f.write(f"Objects: {len(log_entries)} | With GT: {n_with_gt}\n")
+            f.write(f"SAM3 correct: {n_sam3_correct}/{n_with_gt} | SigLIP correct: {n_siglip_correct}/{n_with_gt}\n\n")
+            for e in sorted(log_entries, key=lambda x: -x["n_points"]):
+                sam3_match = "SAM3-OK" if e['gt_class'] == e['sam3_class'] else ""
+                siglip_match = "SigLIP-OK" if e['gt_class'] == e['dense']['top1'] else ""
+                status = sam3_match or siglip_match or ("WRONG" if e['gt_class'] != "N/A" else "")
+                f.write(f"Object ID: {e['obj_id']} | Points: {e['n_points']:,} | KF: {e['n_kf']} [{status}]\n")
+                f.write(f"  GT: {e['gt_class']}\n")
+                f.write(f"  SAM3: {e['sam3_class']} ({100*e['sam3_conf']:.0f}%)\n")
+                if e['sam3_votes']:
+                    f.write(f"    Votes: {'; '.join(e['sam3_votes'])}\n")
+                v = e['dense']
+                t3 = ", ".join([cn[:12] for cn, _ in v["top3"][:3]]) if v["top3"] else "N/A"
+                gt_marker = " <-- GT" if v['top1'] == e['gt_class'] else ""
+                f.write(f"  SigLIP: {v['top1']:<18} {100*v['conf']:.1f}% (range={v['raw_range']:.3f}) [{t3}]{gt_marker}\n")
+                f.write("\n")
+        print(f"[Diagnostic] instance_predictions.txt: {len(log_entries)} objects (SAM3: {n_sam3_correct}/{n_with_gt}, SigLIP: {n_siglip_correct}/{n_with_gt})")
+
     def _validate_with_siglip_kpool(self, class_names, validation_config=None):
-        """SigLIP K-Pool Validation for SAM3 predictions."""
+        """SigLIP K-Pool Validation for SAM3 predictions.
+        
+        NEW: For low-vote/low-confidence objects, use FULL 200-class taxonomy
+        instead of just the voted candidates.
+        """
         if validation_config is None:
             validation_config = self.config.get("siglip_validation", {})
         
@@ -2913,28 +3630,65 @@ class ReplicaFusionPipeline:
         min_keyframes = validation_config.get("min_keyframes", 3)
         min_siglip_conf = validation_config.get("min_siglip_conf", 0.50)
         temperature = validation_config.get("temperature", 0.1)
+        min_vote_conf = validation_config.get("min_vote_conf", 0.35)
+        min_vote_margin = validation_config.get("min_vote_margin", 0.10)
+        full_taxonomy_threshold = validation_config.get("full_taxonomy_threshold", 5)
+        
+        # Re-ranking and Hybrid mode thresholds
+        rerank_enabled = validation_config.get("rerank_enabled", True)
+        rerank_conf_threshold = validation_config.get("rerank_conf_threshold", 0.60)
+        rerank_margin_threshold = validation_config.get("rerank_margin_threshold", 0.20)
+        hybrid_enabled = validation_config.get("hybrid_enabled", True)
+        hybrid_conf_threshold = validation_config.get("hybrid_conf_threshold", 0.40)
+        hybrid_min_candidates = validation_config.get("hybrid_min_candidates", 3)
+        hybrid_siglip_min_conf = validation_config.get("hybrid_siglip_min_conf", 0.015)  # 1.5%
         
         print(f"\n{Log.HEADER}=== SIGLIP K-POOL VALIDATION ==={Log.END}")
         validated_labels = {}
-        stats = {"validated": 0, "overrides": 0}
+        stats = {"validated": 0, "overrides": 0, "low_conf_overrides": 0, "full_taxonomy_overrides": 0, "rerank_overrides": 0, "hybrid_additions": 0}
+        comparison_log = []  # Track SAM3 vs SigLIP confidence for analysis
+        full_taxonomy_diagnostic = []  # Diagnostic: can SigLIP find GT from full taxonomy?
         cg = self.semantic_mapper.clip_generator
         
+        # Get full 200-class text embeddings if available
+        backbone = _SEMANTIC_CACHE.get(self.config.get('sem_name'))
+        full_text_bank = getattr(backbone, 'full_text_bank', None) if backbone else None
+        full_class_names = list(full_text_bank.keys()) if full_text_bank else None
+        full_text_embeds = None
+        if full_text_bank and len(full_text_bank) > 0:
+            full_text_embeds = torch.stack([full_text_bank[cn].squeeze() for cn in full_class_names]).to(self.device)
+            full_text_embeds = full_text_embeds / (full_text_embeds.norm(dim=-1, keepdim=True) + 1e-6)
+            print(f"[SigLIP-Val] Full taxonomy available: {len(full_class_names)} classes")
+        else:
+            print(f"[SigLIP-Val] WARNING: full_text_bank not available! Full-taxonomy override disabled.")
+        
         for obj_id, obj in self.semantic_mapper.objects.items():
-            sam3_class = obj.semantic_class_idx
             sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
             total_votes = sum(sam3_votes.values())
             
-            if total_votes < min_votes or obj.clip_feature is None:
+            if total_votes > 0:
+                sorted_votes = sorted(sam3_votes.items(), key=lambda x: -x[1])
+                sam3_class = sorted_votes[0][0]
+                sam3_conf = sorted_votes[0][1] / total_votes
+                second_conf = sorted_votes[1][1] / total_votes if len(sorted_votes) > 1 else 0.0
+                vote_margin = sam3_conf - second_conf
+            else:
+                sam3_class = obj.semantic_class_idx
+                sam3_conf = 0.0
+                vote_margin = 0.0
+            
+            if obj.clip_feature is None:
+                validated_labels[obj_id] = sam3_class
                 continue
             if len(obj.kfs_ids) < min_keyframes:
-                validated_labels[obj_id] = sam3_class
+                validated_labels[obj_id] = sam3_class  # Keep SAM3 prediction, skip SigLIP validation
                 continue
             
-            sam3_conf = sam3_votes.get(sam3_class, 0) / total_votes if total_votes > 0 else 0.0
-            candidate_indices = list(sam3_votes.keys())
-            if not candidate_indices:
-                validated_labels[obj_id] = sam3_class
-                continue
+            # DISABLED: Full taxonomy override doesn't work - SigLIP confidence too low
+            # Even 9.9% "best" class vs 0.5% random is not enough signal for 200 classes
+            n_keyframes = len(obj.kfs_ids)
+            use_full_taxonomy = False  # Disabled entirely
+            low_confidence = sam3_conf < min_vote_conf or vote_margin < min_vote_margin
             
             try:
                 img_feat = obj.clip_feature.to(self.device).float()
@@ -2942,44 +3696,406 @@ class ReplicaFusionPipeline:
                 if img_feat.dim() == 1:
                     img_feat = img_feat.unsqueeze(0)
                 
-                txt_embeds = []
-                for idx in candidate_indices:
-                    name = class_names[idx] if 0 <= idx < len(class_names) else "object"
-                    templated = [t.format(name.replace("-", " ")) for t in IMAGENET_TEMPLATES]
-                    embed = cg.get_txt_embedding(templated).mean(0).float()
-                    txt_embeds.append(torch.nn.functional.normalize(embed, p=2, dim=-1))
-                txt_embeds = torch.stack(txt_embeds)
+                # DIAGNOSTIC: Always compute full taxonomy predictions for GT comparison
+                if full_text_embeds is not None:
+                    full_sims = (img_feat @ full_text_embeds.T).squeeze()
+                    
+                    # RAW SIMILARITY STATS (before softmax) - KEY DIAGNOSTIC
+                    raw_min = full_sims.min().item()
+                    raw_max = full_sims.max().item()
+                    raw_mean = full_sims.mean().item()
+                    raw_std = full_sims.std().item()
+                    raw_range = raw_max - raw_min
+                    
+                    full_probs = torch.softmax(full_sims / temperature, dim=-1)
+                    top10_vals, top10_idx = full_probs.topk(min(10, len(full_class_names)))
+                    top10_classes = [(full_class_names[idx.item()], top10_vals[i].item()) for i, idx in enumerate(top10_idx)]
+                    top10_raw_sims = [full_sims[idx.item()].item() for idx in top10_idx]
+                    
+                    sam3_class_name = class_names[sam3_class] if 0 <= sam3_class < len(class_names) else ""
+                    full_taxonomy_diagnostic.append({
+                        "obj_id": obj_id,
+                        "sam3_class": sam3_class_name,
+                        "sam3_conf": sam3_conf,
+                        "siglip_top10": top10_classes,
+                        "n_keyframes": n_keyframes,
+                        "total_votes": total_votes,
+                        "raw_stats": {"min": raw_min, "max": raw_max, "mean": raw_mean, "std": raw_std, "range": raw_range},
+                        "top10_raw": top10_raw_sims
+                    })
                 
-                sims = (img_feat @ txt_embeds.T).squeeze()
-                if sims.dim() == 0:
-                    best_idx, siglip_conf = 0, 1.0
+                # Combine with cropped-region CLS features if available
+                # NEW: Use individual Cropped/BBox views from _view_diagnostics_cache for better accuracy
+                use_cropped = validation_config.get("use_cropped_cls", False)
+                cropped_weight = validation_config.get("cropped_cls_weight", 0.3)
+                view_voting_enabled = validation_config.get("view_voting", True)
+                
+                # Try to get individual views from cache (more accurate than combined)
+                view_diag = getattr(self, '_view_diagnostics_cache', {}).get(obj_id, None)
+                if use_cropped and view_diag is not None:
+                    # Use average of Cropped + BBox views (skip Global - too scene-dominated)
+                    cropped_feat = view_diag.get("cropped_feat")
+                    bbox_feat = view_diag.get("bbox_feat")
+                    if cropped_feat is not None and bbox_feat is not None:
+                        cropped_feat = cropped_feat.to(self.device).float()
+                        bbox_feat = bbox_feat.to(self.device).float()
+                        if cropped_feat.dim() == 1:
+                            cropped_feat = cropped_feat.unsqueeze(0)
+                        if bbox_feat.dim() == 1:
+                            bbox_feat = bbox_feat.unsqueeze(0)
+                        # Average Cropped + BBox (both are good, Global is noisy)
+                        view_feat = (cropped_feat + bbox_feat) / 2
+                        view_feat = view_feat / (view_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                        # Weighted combination: (1-w)*mask_pooled + w*view_feat
+                        img_feat = (1 - cropped_weight) * img_feat + cropped_weight * view_feat
+                        img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                elif use_cropped and obj_id in getattr(self, 'cropped_cls_features', {}):
+                    # Fallback to combined cropped features
+                    cropped_feat = self.cropped_cls_features[obj_id].to(self.device).float()
+                    if cropped_feat.dim() == 1:
+                        cropped_feat = cropped_feat.unsqueeze(0)
+                    img_feat = (1 - cropped_weight) * img_feat + cropped_weight * cropped_feat
+                    img_feat = img_feat / (img_feat.norm(dim=-1, keepdim=True) + 1e-6)
+                
+                if use_full_taxonomy:
+                    # For full taxonomy (200 classes), use SOFTMAX with scaled threshold
+                    # Softmax over 200 classes gives ~1-2% per class, so use 3% threshold
+                    sims = (img_feat @ full_text_embeds.T).squeeze()
+                    probs = torch.softmax(sims / temperature, dim=-1)
+                    
+                    # Get top-2 for margin comparison
+                    top2_vals, top2_idx = probs.topk(2)
+                    best_idx = top2_idx[0].item()
+                    best_prob = top2_vals[0].item()
+                    second_prob = top2_vals[1].item()
+                    prob_margin = best_prob - second_prob
+                    
+                    siglip_class_name = full_class_names[best_idx]
+                    siglip_conf = best_prob  # Softmax probability (1-5% typical range)
+                    
+                    if siglip_class_name in class_names:
+                        siglip_class = class_names.index(siglip_class_name)
+                    else:
+                        siglip_class = best_idx
+                    
+                    # Get SAM3's class probability for comparison
+                    sam3_class_name = class_names[sam3_class] if 0 <= sam3_class < len(class_names) else ""
+                    sam3_prob = probs[full_class_names.index(sam3_class_name)].item() if sam3_class_name in full_class_names else 0.0
+                    
+                    # === VIEW VOTING OVERRIDE ===
+                    # If both Cropped AND BBox views agree on a class different from SAM3, force override
+                    view_vote_override = False
+                    view_vote_class = None
+                    if view_voting_enabled and view_diag is not None:
+                        cropped_pred = view_diag.get("cropped_pred")
+                        bbox_pred = view_diag.get("bbox_pred")
+                        if cropped_pred is not None and bbox_pred is not None:
+                            # Both views agree AND different from SAM3
+                            if cropped_pred == bbox_pred and cropped_pred != sam3_class_name:
+                                view_vote_class_name = cropped_pred
+                                if view_vote_class_name in class_names:
+                                    view_vote_class = class_names.index(view_vote_class_name)
+                                    view_vote_override = True
+                                    stats["view_vote_overrides"] = stats.get("view_vote_overrides", 0) + 1
+                    
+                    # Standard override: SigLIP class differs AND SigLIP prob > SAM3 prob * 1.5
+                    should_override = (
+                        siglip_class != sam3_class and 
+                        best_prob > sam3_prob * 1.5 and  # SigLIP 50% more confident
+                        best_prob > 0.02  # At least 2% confidence (scaled for 200 classes)
+                    )
+                    if should_override:
+                        stats["full_taxonomy_overrides"] += 1
+                    
+                    # View voting takes priority over standard override
+                    if view_vote_override and view_vote_class is not None:
+                        final_class = view_vote_class
+                    elif should_override:
+                        final_class = siglip_class
+                    else:
+                        final_class = sam3_class
                 else:
-                    probs = torch.softmax(sims / temperature, dim=0)
-                    best_idx = probs.argmax().item()
-                    siglip_conf = probs[best_idx].item()
+                    candidate_indices = list(sam3_votes.keys())
+                    if not candidate_indices:
+                        validated_labels[obj_id] = sam3_class
+                        continue
+                    
+                    # HYBRID MODE: Add SigLIP candidates when SAM3 has few/uncertain candidates
+                    hybrid_added = []
+                    if (hybrid_enabled and full_text_embeds is not None and 
+                        sam3_conf < hybrid_conf_threshold and len(candidate_indices) < hybrid_min_candidates):
+                        # Get SigLIP's top predictions from full taxonomy
+                        full_sims = (img_feat @ full_text_embeds.T).squeeze()
+                        full_probs = torch.softmax(full_sims / temperature, dim=-1)
+                        top5_vals, top5_idx = full_probs.topk(5)
+                        
+                        for i, idx in enumerate(top5_idx):
+                            if top5_vals[i].item() < hybrid_siglip_min_conf:
+                                break
+                            siglip_class_name = full_class_names[idx.item()]
+                            if siglip_class_name in class_names:
+                                siglip_idx = class_names.index(siglip_class_name)
+                                if siglip_idx not in candidate_indices:
+                                    candidate_indices.append(siglip_idx)
+                                    hybrid_added.append(siglip_class_name)
+                        
+                        if hybrid_added:
+                            stats["hybrid_additions"] += 1
+                    
+                    txt_embeds = []
+                    for idx in candidate_indices:
+                        name = class_names[idx] if 0 <= idx < len(class_names) else "object"
+                        templated = [t.format(name.replace("-", " ")) for t in IMAGENET_TEMPLATES]
+                        embed = cg.get_txt_embedding(templated).mean(0).float()
+                        txt_embeds.append(torch.nn.functional.normalize(embed, p=2, dim=-1))
+                    txt_embeds = torch.stack(txt_embeds)
+                    
+                    sims = (img_feat @ txt_embeds.T).squeeze()
+                    if sims.dim() == 0:
+                        siglip_probs = torch.tensor([1.0])
+                    else:
+                        siglip_probs = torch.softmax(sims / temperature, dim=-1)
+                    
+                    # Get SigLIP's best prediction
+                    siglip_best_idx = int(siglip_probs.argmax().item())
+                    siglip_class = candidate_indices[siglip_best_idx]
+                    siglip_conf = siglip_probs.max().item()
+                    siglip_class_name = class_names[siglip_class] if 0 <= siglip_class < len(class_names) else ""
+                    sam3_class_name = class_names[sam3_class] if 0 <= sam3_class < len(class_names) else ""
+                    
+                    # === SYNONYM-BASED OVERRIDE (SigLIP refines SAM3) ===
+                    # If SigLIP view is semantically SIMILAR to SAM3 but more specific, override
+                    # If SigLIP view is semantically DIFFERENT from SAM3, it's likely context pollution
+                    synonym_override = False
+                    synonym_override_class = None
+                    view_sims = {}  # For debugging
+                    
+                    synonym_threshold = validation_config.get("synonym_threshold", 0.75)  # High sim = synonym
+                    pollution_threshold = validation_config.get("pollution_threshold", 0.5)  # Low sim = context pollution
+                    
+                    if view_diag is not None:
+                        # Get text embedding for SAM3's prediction
+                        def get_class_embed(class_name):
+                            if class_name not in class_names:
+                                return None
+                            templated = [t.format(class_name.replace("-", " ")) for t in IMAGENET_TEMPLATES]
+                            embed = cg.get_txt_embedding(templated).mean(0).float()
+                            return torch.nn.functional.normalize(embed, p=2, dim=-1)
+                        
+                        sam3_embed = get_class_embed(sam3_class_name)
+                        
+                        if sam3_embed is not None:
+                            # Check each view's similarity to SAM3
+                            for view_name in ["cropped_pred", "bbox_pred", "global_pred", "dense_pred"]:
+                                view_pred = view_diag.get(view_name)
+                                if view_pred is not None and view_pred != sam3_class_name:
+                                    view_embed = get_class_embed(view_pred)
+                                    if view_embed is not None:
+                                        sim = (view_embed @ sam3_embed).item()
+                                        view_sims[view_name] = (view_pred, sim)
+                                        
+                                        # If view is semantically similar to SAM3 (synonym),
+                                        # trust the view as a more specific version
+                                        if sim > synonym_threshold and view_pred in class_names:
+                                            synonym_override = True
+                                            synonym_override_class = class_names.index(view_pred)
+                                            stats["synonym_refinements"] = stats.get("synonym_refinements", 0) + 1
+                                            break  # Take first matching view
+                            
+                            # Log similarities for debugging
+                            if view_sims:
+                                sim_strs = [f"{k.replace('_pred','')}:{v[0]}={v[1]:.2f}" for k,v in view_sims.items()]
+                                stats.setdefault("sim_logs", []).append(f"ID{obj_id} SAM3={sam3_class_name}: {', '.join(sim_strs)}")
+                    
+                    # === CONTEXT POLLUTION CHECK ===
+                    # Block override if ALL views agree on something very different from SAM3
+                    # (This is likely context pollution from nearby objects)
+                    context_pollution = False
+                    if view_diag is not None and sam3_embed is not None:
+                        cropped_pred = view_diag.get("cropped_pred")
+                        bbox_pred = view_diag.get("bbox_pred")
+                        
+                        if cropped_pred and bbox_pred and cropped_pred == bbox_pred and cropped_pred != sam3_class_name:
+                            # Views agree on something different from SAM3
+                            agreed_embed = get_class_embed(cropped_pred)
+                            if agreed_embed is not None:
+                                agreed_sim = (agreed_embed @ sam3_embed).item()
+                                # If very different from SAM3 AND SAM3 has high confidence, block
+                                if agreed_sim < pollution_threshold and sam3_conf > 0.90:
+                                    context_pollution = True
+                                    stats["context_pollution_blocked"] = stats.get("context_pollution_blocked", 0) + 1
+                    
+                    # === FINAL OVERRIDE DECISION ===
+                    should_override = False
+                    
+                    if synonym_override and not context_pollution:
+                        should_override = True
+                        final_class = synonym_override_class
+                    else:
+                        final_class = sam3_class
                 
-                siglip_class = candidate_indices[best_idx]
-                should_override = siglip_class != sam3_class and (siglip_conf > 0.6 or (siglip_conf > min_siglip_conf and sam3_conf < 0.8))
-                
-                validated_labels[obj_id] = siglip_class if should_override else sam3_class
+                validated_labels[obj_id] = final_class
                 stats["validated"] += 1
                 if should_override:
                     stats["overrides"] += 1
-            except:
+                
+                # Log comparison for analysis
+                sam3_name = class_names[sam3_class] if 0 <= sam3_class < len(class_names) else f"idx_{sam3_class}"
+                siglip_name = class_names[siglip_class] if 0 <= siglip_class < len(class_names) else f"idx_{siglip_class}"
+                comparison_log.append({
+                    "obj_id": obj_id,
+                    "sam3_class": sam3_name,
+                    "sam3_conf": sam3_conf,
+                    "siglip_class": siglip_name,
+                    "siglip_conf": siglip_conf,
+                    "override": should_override,
+                    "total_votes": total_votes,
+                    "n_keyframes": len(obj.kfs_ids)
+                })
+            except Exception as e:
                 validated_labels[obj_id] = sam3_class
         
+        # Print summary stats
+        synonym_refinements = stats.get("synonym_refinements", 0)
+        pollution_blocked = stats.get("context_pollution_blocked", 0)
         print(f"[SigLIP-Val] {stats['validated']} validated, {stats['overrides']} overrides")
+        print(f"[SigLIP-Val]   - {synonym_refinements} synonym refinements (e.g. counter->kitchen counter)")
+        print(f"[SigLIP-Val]   - {pollution_blocked} blocked by context pollution check")
+        print(f"[SigLIP-Val]   - {stats['full_taxonomy_overrides']} full-taxonomy overrides")
+        
+        # Print similarity logs for debugging
+        sim_logs = stats.get("sim_logs", [])
+        if sim_logs:
+            print(f"[SigLIP-Val] View<->SAM3 similarities ({len(sim_logs)} objects with differing views):")
+            for log in sim_logs[:20]:  # First 20
+                print(f"  {log}")
+        
+        if hasattr(self, 'output_dir') and self.output_dir:
+            val_log_path = os.path.join(self.output_dir, "siglip_validation.txt")
+            with open(val_log_path, 'w') as f:
+                f.write("=== SIGLIP K-POOL VALIDATION LOG ===\n\n")
+                f.write(f"Total validated: {stats['validated']}\n")
+                f.write(f"Total overrides: {stats['overrides']}\n")
+                f.write(f"  - Synonym refinements: {synonym_refinements}\n")
+                f.write(f"  - Context pollution blocked: {pollution_blocked}\n")
+                f.write(f"  - Full-taxonomy overrides: {stats['full_taxonomy_overrides']}\n\n")
+                
+                for obj_id, final_class in validated_labels.items():
+                    obj = self.semantic_mapper.objects.get(obj_id)
+                    if obj is None:
+                        continue
+                    sam3_votes = dict(obj.semantic_class_votes) if hasattr(obj, 'semantic_class_votes') else {}
+                    total_votes = sum(sam3_votes.values())
+                    if total_votes > 0:
+                        sorted_votes = sorted(sam3_votes.items(), key=lambda x: -x[1])
+                        orig_class = sorted_votes[0][0]
+                        orig_name = class_names[orig_class] if 0 <= orig_class < len(class_names) else f"idx_{orig_class}"
+                        final_name = class_names[final_class] if 0 <= final_class < len(class_names) else f"idx_{final_class}"
+                        
+                        if orig_class != final_class:
+                            f.write(f"[OVERRIDE] ID {obj_id}: {orig_name} -> {final_name}\n")
+                            for cls_idx, votes in sorted_votes[:3]:
+                                cls_name = class_names[cls_idx] if 0 <= cls_idx < len(class_names) else f"idx_{cls_idx}"
+                                f.write(f"    {cls_name}: {votes} votes ({100*votes/total_votes:.1f}%)\n")
+            print(f"[SigLIP-Val] Log saved to: {val_log_path}")
+            
+            # Write detailed SAM3 vs SigLIP confidence comparison
+            comparison_path = os.path.join(self.output_dir, "sam3_vs_siglip_comparison.txt")
+            with open(comparison_path, 'w') as f:
+                f.write("=== SAM3 vs SigLIP CONFIDENCE COMPARISON ===\n\n")
+                f.write(f"Total objects compared: {len(comparison_log)}\n")
+                f.write(f"Overrides: {stats['overrides']}\n")
+                f.write(f"Agreement rate: {100*(len(comparison_log)-stats['overrides'])/max(len(comparison_log),1):.1f}%\n\n")
+                
+                # Compute statistics
+                sam3_confs = [c["sam3_conf"] for c in comparison_log]
+                siglip_confs = [c["siglip_conf"] for c in comparison_log]
+                if sam3_confs:
+                    f.write(f"SAM3 Confidence:  avg={100*sum(sam3_confs)/len(sam3_confs):.1f}%\n")
+                    f.write(f"SigLIP Confidence: avg={100*sum(siglip_confs)/len(siglip_confs):.1f}%\n\n")
+                
+                # Cases where SAM3 and SigLIP disagree
+                disagreements = [c for c in comparison_log if c["sam3_class"] != c["siglip_class"]]
+                f.write(f"=== DISAGREEMENTS ({len(disagreements)}) ===\n")
+                f.write("-" * 80 + "\n")
+                for c in sorted(disagreements, key=lambda x: -x["siglip_conf"]):
+                    override_str = "OVERRIDE" if c["override"] else "KEPT SAM3"
+                    f.write(f"ID {c['obj_id']}: [{override_str}]\n")
+                    f.write(f"  SAM3:   {c['sam3_class']:<25} conf={100*c['sam3_conf']:.1f}%\n")
+                    f.write(f"  SigLIP: {c['siglip_class']:<25} conf={100*c['siglip_conf']:.1f}%\n")
+                    f.write(f"  Votes: {c['total_votes']}, Keyframes: {c['n_keyframes']}\n\n")
+                
+                # Cases where they agree
+                agreements = [c for c in comparison_log if c["sam3_class"] == c["siglip_class"]]
+                f.write(f"\n=== AGREEMENTS ({len(agreements)}) ===\n")
+                f.write("-" * 80 + "\n")
+                for c in sorted(agreements, key=lambda x: -x["sam3_conf"])[:20]:
+                    f.write(f"ID {c['obj_id']}: {c['sam3_class']:<25} SAM3={100*c['sam3_conf']:.1f}% SigLIP={100*c['siglip_conf']:.1f}%\n")
+                if len(agreements) > 20:
+                    f.write(f"... and {len(agreements)-20} more\n")
+            
+            print(f"[SigLIP-Val] Comparison saved to: {comparison_path}")
+            
+            # Write full taxonomy diagnostic (for GT comparison later)
+            if full_taxonomy_diagnostic:
+                diag_path = os.path.join(self.output_dir, "siglip_full_taxonomy_diagnostic.txt")
+                with open(diag_path, 'w') as f:
+                    f.write("=== SIGLIP FULL TAXONOMY DIAGNOSTIC ===\n")
+                    f.write("Can SigLIP find the correct class from 200 options?\n")
+                    f.write("Compare SigLIP top-10 predictions against GT labels after evaluation.\n\n")
+                    f.write(f"Total objects analyzed: {len(full_taxonomy_diagnostic)}\n\n")
+                    
+                    for entry in full_taxonomy_diagnostic:
+                        f.write(f"--- Object ID: {entry['obj_id']} ---\n")
+                        f.write(f"  SAM3 prediction: {entry['sam3_class']} (conf={100*entry['sam3_conf']:.1f}%)\n")
+                        f.write(f"  Keyframes: {entry['n_keyframes']}, Votes: {entry['total_votes']}\n")
+                        
+                        # RAW SIMILARITY STATS - KEY DIAGNOSTIC
+                        if 'raw_stats' in entry:
+                            rs = entry['raw_stats']
+                            f.write(f"  RAW COSINE SIMILARITY: min={rs['min']:.4f}, max={rs['max']:.4f}, range={rs['range']:.4f}\n")
+                            f.write(f"                         mean={rs['mean']:.4f}, std={rs['std']:.4f}\n")
+                        
+                        f.write(f"  SigLIP Top-10 from full taxonomy:\n")
+                        top10_raw = entry.get('top10_raw', [])
+                        for i, (cls_name, prob) in enumerate(entry['siglip_top10']):
+                            raw_str = f" (raw={top10_raw[i]:.4f})" if i < len(top10_raw) else ""
+                            f.write(f"    {i+1}. {cls_name}: {100*prob:.2f}%{raw_str}\n")
+                        f.write("\n")
+                
+                print(f"[SigLIP-Val] Full taxonomy diagnostic saved to: {diag_path}")
+                
+                # Store for later GT comparison in _finalize
+                self._full_taxonomy_diagnostic = full_taxonomy_diagnostic
+        
         return validated_labels
 
-def discover_scene_classes(loader, backbone, full_text_bank, config, device):
-    """Use SigLIP to discover which classes are present in a scene."""
+def discover_scene_classes(loader, backbone, full_text_bank, config, device, output_dir=None):
+    """Use SigLIP DENSE PATCH features to discover which classes are present in a scene.
+    
+    Dense discovery looks at individual patches, not just global CLS token.
+    This helps find spatially-localized objects and avoids generic classes.
+    """
     discovery_frames = config.get("discovery_frames", 20)
     top_k = config.get("top_k_classes", 40)
+    min_confidence = config.get("min_confidence", 0.15)  # Minimum max_sim to include a class
+    use_dense = config.get("dense_discovery", False)  # Disabled by default - global CLS works better
+    
+    # Blacklist generic/problematic classes that cause hallucinations
+    BLACKLIST = {
+        "seat",           # Always confuses with chair/floor
+        "furniture",      # Too generic - absorbs everything
+        "structure",      # Meaningless
+        "object",         # Meaningless
+    }
     
     class_names = list(full_text_bank.keys())
+    # Filter out blacklisted classes
+    filtered_class_names = [cn for cn in class_names if cn not in BLACKLIST]
+    
     # Ensure consistent embedding shapes (squeeze any extra dims)
     emb_list = []
-    for cn in class_names:
+    for cn in filtered_class_names:
         emb = full_text_bank[cn]
         if emb.dim() > 1:
             emb = emb.squeeze()
@@ -2987,45 +4103,111 @@ def discover_scene_classes(loader, backbone, full_text_bank, config, device):
     text_embeds = torch.stack(emb_list).to(device)
     text_embeds = text_embeds / text_embeds.norm(dim=-1, keepdim=True)
     
-    class_scores = {cn: 0.0 for cn in class_names}
-    total_frames = len(loader)
+    # Track both max similarity and vote counts per class
+    class_max_scores = {cn: 0.0 for cn in filtered_class_names}
+    class_vote_counts = {cn: 0 for cn in filtered_class_names}
     
-    # UNIFORM SAMPLING: Sample frames across ENTIRE video, not just first N
+    total_frames = len(loader)
     frame_indices = np.linspace(0, total_frames - 1, min(discovery_frames, total_frames), dtype=int)
     
-    print(f"[Discovery] Scanning {len(frame_indices)} frames uniformly across video (0 to {total_frames-1})...")
+    print(f"[Discovery] Scanning {len(frame_indices)} frames with {'DENSE' if use_dense else 'GLOBAL'} features...")
+    print(f"[Discovery] Blacklisted {len(BLACKLIST)} problematic classes: {BLACKLIST}")
+    
+    from PIL import Image
     
     for i in frame_indices:
-        _, rgb, _, _ = loader[i]  # Unpack tuple: (index, color, depth, pose)
+        _, rgb, _, _ = loader[i]
         
         with torch.no_grad():
-            # Convert numpy to PIL for backbone
-            from PIL import Image
             rgb_pil = Image.fromarray(rgb)
             
-            # Use GLOBAL CLS token for discovery (more discriminative than patches)
-            if hasattr(backbone, 'encode_image_dense'):
-                _, global_cls = backbone.encode_image_dense(rgb_pil)
-                features = global_cls.squeeze()  # (D,) - global CLS token
+            if use_dense and hasattr(backbone, 'encode_image_dense'):
+                # DENSE: Use patch-level features for spatial discovery
+                patch_features, global_cls = backbone.encode_image_dense(rgb_pil)
+                
+                if patch_features.dim() == 3:
+                    patch_features = patch_features.squeeze(0)  # (N_patches, D)
+                patch_features = patch_features / (patch_features.norm(dim=-1, keepdim=True) + 1e-6)
+                
+                # Score each patch against all classes
+                patch_sims = patch_features @ text_embeds.T  # (N_patches, N_classes)
+                
+                # Track max similarity per class (is it strongly present anywhere?)
+                per_class_max = patch_sims.max(dim=0).values  # (N_classes,)
+                
+                # Track which class wins each patch (vote counting)
+                patch_winners = patch_sims.argmax(dim=-1)  # (N_patches,)
+                
+                for j, cn in enumerate(filtered_class_names):
+                    class_max_scores[cn] = max(class_max_scores[cn], per_class_max[j].item())
+                    class_vote_counts[cn] += (patch_winners == j).sum().item()
             else:
-                features = backbone.encode_image(rgb_pil).squeeze()  # (D,)
+                # GLOBAL: Fallback to CLS token
+                if hasattr(backbone, 'encode_image_dense'):
+                    _, global_cls = backbone.encode_image_dense(rgb_pil)
+                    features = global_cls.squeeze()
+                else:
+                    features = backbone.encode_image(rgb_pil).squeeze()
+                
+                features = features / (features.norm(dim=-1, keepdim=True) + 1e-6)
+                sims = features @ text_embeds.T
+                
+                for j, cn in enumerate(filtered_class_names):
+                    class_max_scores[cn] = max(class_max_scores[cn], sims[j].item())
+                    class_vote_counts[cn] += 1 if sims[j].item() > 0.2 else 0
+    
+    # Sort by max_sim
+    sorted_scores = sorted(class_max_scores.items(), key=lambda x: -x[1])
+    
+    # Save detailed similarity log to output directory
+    if output_dir:
+        discovery_log_path = os.path.join(output_dir, "discovery_similarities.txt")
+        with open(discovery_log_path, 'w') as f:
+            f.write("=== CLASS DISCOVERY SIMILARITY LOG ===\n")
+            f.write(f"Frames scanned: {len(frame_indices)}\n")
+            f.write(f"Total classes evaluated: {len(filtered_class_names)}\n")
+            f.write(f"Min confidence threshold: {min_confidence}\n")
+            f.write(f"Top-K limit: {top_k}\n\n")
             
-            features = features / features.norm(dim=-1, keepdim=True)
-            # Direct cosine similarity (no softmax - just accumulate raw sims)
-            sims = features @ text_embeds.T  # (200,)
+            f.write("=" * 60 + "\n")
+            f.write(f"{'Rank':<6}{'Class Name':<30}{'Max Sim':<12}{'Votes':<10}\n")
+            f.write("=" * 60 + "\n")
             
-            # Use raw similarity scores (not softmax) for better discrimination
-            for j, cn in enumerate(class_names):
-                class_scores[cn] = max(class_scores[cn], sims[j].item())
+            for rank, (cn, max_sim) in enumerate(sorted_scores, 1):
+                votes = class_vote_counts[cn]
+                passed = "✓" if max_sim >= min_confidence else ""
+                f.write(f"{rank:<6}{cn:<30}{max_sim:<12.4f}{votes:<10}{passed}\n")
+            
+            f.write("\n" + "=" * 60 + "\n")
+            f.write(f"Classes passing threshold ({min_confidence}): {len([s for s in sorted_scores if s[1] >= min_confidence])}\n")
+        print(f"[Discovery] Similarity log saved to: {discovery_log_path}")
     
-    # Debug: show top scores
-    sorted_scores = sorted(class_scores.items(), key=lambda x: -x[1])
-    print(f"[Discovery] Top 10 class scores: {[(cn, f'{s:.3f}') for cn, s in sorted_scores[:10]]}")
+    # Debug output
+    print(f"[Discovery] Top 15 by max_sim (min_confidence={min_confidence}):")
+    for cn, max_sim in sorted_scores[:15]:
+        print(f"    {cn}: max_sim={max_sim:.3f}, votes={class_vote_counts[cn]}")
     
-    # Just take top-k regardless of threshold (softmax spreads prob too thin across 200 classes)
-    discovered = [cn for cn, _ in sorted_scores[:top_k]]
+    # Filter by min_confidence, then take top-k (capped at threshold-passing count)
+    filtered = [(cn, score) for cn, score in sorted_scores if score >= min_confidence]
+    print(f"[Discovery] {len(filtered)} classes passed min_confidence={min_confidence}")
+
+    # Determine effective top_k: cap at number of classes passing threshold
+    if isinstance(top_k, bool) and top_k == True:
+        # True means "use all passing classes"
+        effective_k = len(filtered)
+    elif isinstance(top_k, int):
+        # Integer means "cap at this number, but never exceed threshold-passing count"
+        effective_k = min(top_k, len(filtered)) if len(filtered) > 0 else 0
+    else:
+        effective_k = len(filtered)
     
-    print(f"[Discovery] Selected top {len(discovered)} classes: {discovered[:10]}...")
+    if effective_k == 0:
+        print(f"[Discovery] WARNING: No classes passed threshold ({min_confidence})! Scene may have issues.")
+        discovered = []
+    else:
+        discovered = [cn for cn, _ in filtered[:effective_k]]
+    
+    print(f"[Discovery] Selected {len(discovered)} classes (top_k={top_k}, effective={effective_k}): {discovered[:10]}...")
     return discovered
 
 
@@ -3085,19 +4267,9 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         print(f"[Error] No frames found in {dataset_config['input_path']}")
         return None
 
-    # 3. Setup Mask Generator Config
+    # 3. Setup Weight Paths (used in pipeline_config below)
     weights_path = os.path.join(script_dir, "weights", "mobile_sam.pt") if script_dir else "weights/mobile_sam.pt"
     sam3_weights = os.path.join(script_dir, "weights", "sam3.pt") if script_dir else "weights/sam3.pt"
-
-    mask_gen_config = {
-        "precomputed": False,
-        "masks_base_path": os.path.join(project_root, "masks"),
-        "nms_iou_th": 0.8,
-        "nms_score_th": 0.7,
-        "model_type": mask_mode,
-        "mobile_sam_weights": weights_path,
-        "sam3_weights": sam3_weights
-    }
 
     # 4. Setup Backbone & Text Embeddings
     backbone = _SEMANTIC_CACHE[sem_cfg['name']]
@@ -3128,10 +4300,21 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
         if use_siglip_discovery:
             discovery_config = {
                 "discovery_frames": 1000,
-                "top_k_classes": 40,
-                "min_confidence": 0.01,  # Lower threshold - softmax across 200 classes spreads probability thin
+                "top_k_classes": 30, 
+                "min_confidence": 0.096
             }
-            discovered_classes = discover_scene_classes(loader, backbone, full_text_bank, discovery_config, DEVICE)
+            
+            # Check discovery cache first
+            cached_classes = get_cached_discovery(project_root, scene, discovery_config["discovery_frames"])
+            
+            if cached_classes is not None:
+                # Cache hit - use cached discovered classes
+                discovered_classes = cached_classes
+            else:
+                # Cache miss - run discovery and update cache
+                discovered_classes = discover_scene_classes(loader, backbone, full_text_bank, discovery_config, DEVICE, output_dir=output_dir)
+                update_discovery_cache(project_root, scene, discovered_classes, discovery_config["discovery_frames"])
+            
             original_classes = loader.class_names  # These are the actual GT classes from aggregation.json
             
             # Validate discovery: how many GT classes were found?
@@ -3187,7 +4370,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
 
     # 8. Setup SAM3 prompts (AFTER potential discovery modification)
     sam3_prompt_mapping = {}
-    if mask_mode == "sam3_semantic":
+    if mask_mode in ("sam3_semantic", "sam3_hybrid"):
         sam3_prompts = loader.class_names
         for cn in loader.class_names:
             sam3_prompt_mapping[cn] = {
@@ -3199,7 +4382,66 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
     else:
         sam3_prompts = None
     
-    mask_gen = MaskGenerator(mask_gen_config, scene_name=scene, device=DEVICE, class_names=sam3_prompts)
+    # 9. Pipeline Config
+    pipeline_config = {
+        "sem_name": sem_cfg['name'],
+        "max_frames": 5000,
+        "mapping": { 
+            "map_every": 10, 
+            "downscale_ratio": 3,
+            "k_pooling": 3,            
+            "max_frame_points": 80000,
+            "max_total_points": 500000,
+            "voxel_size": 0.02
+        },
+        "tracking": { "track_every": 1 },
+        "semantic": { "segment_every": 10 },
+        "track_th": 1500,
+        "th_centroid": 1.0,
+        "th_cossim": 0.80,
+        "th_points": 0.1,                   # Min point overlap ratio for instance fusion
+        "match_distance_th": 0.08,
+        "min_semantic_fusion_points": 50000, # Force semantic check for objects with >N points
+        "allow_geometric_only": True,       # Allow fusion when CLIP features pending
+        "async_clip": True,                 # Enable async CLIP processing
+        "multiprocessing_clip": False,      # Use multiprocessing (vs threading) for CLIP
+        "clip": { 
+            "embed_type": "fused", 
+            "k_top_views": 10, 
+            "dense_features": True
+        },
+        "mask_gen": {
+            "precomputed": False,
+            "masks_base_path": os.path.join(project_root, "masks"),
+            "nms_iou_th": 0.5,
+            "nms_score_th": 0.8,
+            "model_type": mask_mode,
+            "mobile_sam_weights": weights_path,
+            "sam3_weights": sam3_weights
+        },
+        "detailed_logging": False,
+        "vis": { "stream": False },
+        "use_clip_per_mask": False,
+        "siglip_validation": {
+            "enabled": True,
+            "min_votes": 2,
+            "min_keyframes": 2,
+            "min_siglip_conf": 0.1,
+            "temperature": 1.0,
+            "synonym_threshold": 0.86,
+            "min_vote_conf": 0.35,
+            "min_vote_margin": 0.10,
+            "full_taxonomy_threshold": 30,
+            "use_cropped_cls": True,
+            "cropped_cls_weight": 0.8,
+            "view_voting": True,
+        },
+        "output_dir": output_dir,
+        "device": DEVICE
+    }
+
+    # 10. Instantiate Mask Generator
+    mask_gen = MaskGenerator(pipeline_config["mask_gen"], scene_name=scene, device=DEVICE, class_names=sam3_prompts)
     
     if output_dir and sam3_prompt_mapping:
         sam3_prompts_path = os.path.join(output_dir, "sam3_selected_prompts.json")
@@ -3207,84 +4449,7 @@ def run_scene_unified(scene, sem_cfg, project_root, cam_config=None, prompt_mode
             json.dump(sam3_prompt_mapping, f, indent=2)
         print(f"[SAM3] Prompt selection saved to: {sam3_prompts_path}")
 
-    # 9. Pipeline Config (Option 1: Conservative)
-    pipeline_config = {
-        "sem_name": sem_cfg['name'],
-        "max_frames": 500,
-        "mapping": { 
-            "map_every": 10, 
-            "downscale_ratio": 3,
-            "k_pooling": 3,            
-            "max_frame_points": 80000,
-            "max_total_points": 500000,
-            "voxel_size": 0.02
-        },
-        "tracking": { "track_every": 1 },
-        "semantic": { "segment_every": 10 },
-        "track_th": 75,
-        "th_centroid": 1.5,
-        "th_cossim": 0.80,
-        "match_distance_th": 0.03,
-        "clip": { 
-            "embed_type": "fused", 
-            "k_top_views": 10, 
-            "mask_res": 384,
-            "dense_features": True
-        },
-        "sam": { "mask_res": 384, "nms_iou_th": 0.5, "nms_score_th": 0.8 },
-        "detailed_logging": False,
-        "vis": { "stream": False },
-        "siglip_validation": {
-            "enabled": True,
-            "min_votes": 3,
-            "min_keyframes": 5,
-            "min_siglip_conf": 0.5,
-            "temperature": 0.1,
-            "synonym_threshold": 0.86,
-        },
-        "output_dir": output_dir,
-        "device": DEVICE
-    }
-
-    # 9b. Pipeline Config (Option 2: Aggressive - uncomment to use)
-    pipeline_config = {
-        "sem_name": sem_cfg['name'],
-        "max_frames": 500,
-        "mapping": { 
-            "map_every": 10, 
-            "downscale_ratio": 3,
-            "k_pooling": 3,            
-            "max_frame_points": 80000,
-            "max_total_points": 500000,
-            "voxel_size": 0.02
-        },
-        "tracking": { "track_every": 1 },
-        "semantic": { "segment_every": 10 },
-        "track_th": 50,
-        "th_centroid": 1.5,
-        "th_cossim": 0.80,
-        "match_distance_th": 0.05,
-        "clip": { 
-            "embed_type": "fused", 
-            "k_top_views": 10, 
-            "mask_res": 384
-        },
-        "sam": { "mask_res": 384, "nms_iou_th": 0.5, "nms_score_th": 0.8 },
-        "detailed_logging": False,
-        "vis": { "stream": False },
-        "siglip_validation": {
-            "enabled": True,
-            "min_votes": 1,
-            "min_keyframes": 1,
-            "min_siglip_conf": 0.20,
-            "temperature": 0.1,
-            "synonym_threshold": 0.86,
-        },
-        "output_dir": output_dir,
-        "device": DEVICE
-    }
-
-    # 10. Instantiate Pipeline
+    # 11. Instantiate Pipeline
     pipeline = ReplicaFusionPipeline(
         scene,
         pipeline_config,
@@ -3317,19 +4482,18 @@ def main():
     # 0. Dataset Selection
     # Options: 'replica' | 'scannet20' | 'scannet200'
     CURRENT_DATASET = 'scannet200'
-    
     # 1. Prompt Mode
     # Options: 'ensemble' (OpenAI Standard) | 'handcrafted' (Your Custom Dict) | 'llm' (LLM-generated)
     CURRENT_PROMPT_MODE = 'ensemble'                                 
 
     # 2. Mask Generator Mode
-    # Options: 'mobile_sam' (Fast, TinyViT) | 'sam3' (Heavy, Video) | 'sam3_semantic' (Text-prompted, needs sam3.pt)
+    # Options: 'mobile_sam' (Fast, TinyViT) | 'sam3' (Heavy, Video) | 'sam3_semantic' (Text-prompted) | 'sam3_hybrid' (Text + class-agnostic)
+    # NOTE: sam3_hybrid combines text-prompted masks with MobileSAM for better coverage
     CURRENT_MASK_MODE = 'sam3_semantic'
 
     # 3. LLM Prompt Generation Config (only used when CURRENT_PROMPT_MODE = 'llm')
     LLM_CONFIG = {
         "model_name": "Qwen/Qwen2.5-7B-Instruct",     # HuggingFace model ID
-        "num_prompts": 5,                              # Prompts per class
         "cache_prompts": True,                         # Cache generated prompts to disk
         "prompts_file": None,                          # Path to pre-generated prompts JSON (optional)
         "track_gpu_usage": True,                       # Track LLM GPU memory usage
@@ -3360,8 +4524,9 @@ def main():
         eval_config_path = os.path.join(script_dir, "scannet200.yaml")
         cam_config_path = os.path.join(script_dir, "scannet.yaml")  # Shared ScanNet camera config
         SCENES = ["scene0011_00", "scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
-        # SCENES = ["scene0011_00"]
+        SCENES = ["scene0011_00"]
         # SCENES = ["scene0050_00", "scene0231_00", "scene0378_00", "scene0518_00"]
+        SCENES = ["scene0050_00"]
     else:
         print(f"[Error] Unknown dataset: {CURRENT_DATASET}")
         return
@@ -3427,7 +4592,7 @@ def main():
         
         print(f" > Loading text bank from: {cache_path}")
         
-        # Helper to load embeddings (assuming this function exists)
+        # Helper to load embeddings 
         text_bank = load_replica_text_embeddings(
             backbone, 
             DEVICE, 
